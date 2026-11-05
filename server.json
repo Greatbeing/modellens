@@ -1,8 +1,13 @@
 {
   "$schema": "https://static.modelcontextprotocol.io/schemas/2025-09-29/server.schema.json",
   "name": "io.github.greatbeing/modellens",
+  "title": "ModelLens",
   "description": "Discover, probe, rank and recommend models across OpenAI-compatible gateways. Turns a model list into measured quality: latency, success rate, cancellation, streaming and tool-call support, with history.",
-  "version": "0.1.0",
+  "version": "0.1.1",
+  "repository": {
+    "url": "https://github.com/Greatbeing/modellens",
+    "source": "github"
+  },
   "_meta": {
     "io.modelcontextprotocol.registry/publisher-provided": {
       "usage": {
@@ -14,7 +19,7 @@
     {
       "registryType": "pypi",
       "identifier": "modellens-mcp",
-      "version": "0.1.0",
+      "version": "0.1.1",
       "transport": {
         "type": "stdio"
       },

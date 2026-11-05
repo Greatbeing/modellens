@@ -1,5 +1,7 @@
 # ModelLens
 
+<!-- mcp-name: io.github.greatbeing/modellens -->
+
 **See which of your models actually works.**
 
 An MCP server that turns any OpenAI-compatible gateway into an observable,
