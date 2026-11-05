@@ -1,0 +1,19 @@
+# Smithery configuration — https://smithery.ai/docs/config#smitheryyaml
+startCommand:
+  type: stdio
+  configSchema:
+    type: object
+    properties:
+      configJson:
+        type: string
+        title: Endpoints config (JSON)
+        description: '{"endpoints":[{"name":"openai","base_url":"https://api.openai.com/v1","api_key":"sk-..."}]}'
+    required: []
+  commandFunction: |-
+    (config) => ({
+      command: 'sh',
+      args: ['-c', 'printf "%s" "$MODELLENS_CFG" > /tmp/modellens-config.json && exec python3 /app/modellens.py --config /tmp/modellens-config.json --data /tmp/modellens-history.json'],
+      env: { MODELLENS_CFG: (config && config.configJson) || '{"endpoints":[]}' }
+    })
+  exampleConfig:
+    configJson: '{"endpoints":[{"name":"openai","base_url":"https://api.openai.com/v1","api_key":"sk-your-key"}]}'
