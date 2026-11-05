@@ -44,7 +44,7 @@ model third. ModelLens found that in one pass.
 
 ```bash
 # from PyPI
-pip install modellens
+pip install modellens-mcp
 modellens --config config.json --data history.json --once ranking
 ```
 

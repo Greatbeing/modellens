@@ -92,7 +92,9 @@
   <h2>Install and point it at your gateway</h2>
 
   <pre><span class="c"># 1. get it</span>
-curl -fsSL https://example.com/modellens/modellens.py -o modellens.py
+# from PyPI
+pip install modellens-mcp
+modellens --once ranking
 
 <span class="c"># 2. say where your models live</span>
 cat &gt; config.json &lt;&lt;EOF
