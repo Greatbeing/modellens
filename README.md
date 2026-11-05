@@ -1,6 +1,6 @@
 # ModelLens
 
-<!-- mcp-name: io.github.greatbeing/modellens -->
+<!-- mcp-name: io.github.Greatbeing/modellens -->
 
 **See which of your models actually works.**
 
