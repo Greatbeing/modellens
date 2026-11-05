@@ -1,0 +1,171 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ModelLens — see which of your models actually works</title>
+<style>
+  :root { --ink:#111; --dim:#666; --line:#e5e5e5; --accent:#2563eb; --bg:#fafafa; }
+  * { box-sizing: border-box; }
+  body { margin:0; font:16px/1.6 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;
+         color:var(--ink); background:var(--bg); }
+  .wrap { max-width: 900px; margin: 0 auto; padding: 48px 24px 80px; }
+  h1 { font-size: 40px; line-height:1.15; margin: 0 0 8px; letter-spacing:-.02em; }
+  .tag { color: var(--dim); font-size: 19px; margin: 0 0 32px; }
+  h2 { font-size: 22px; margin: 48px 0 12px; letter-spacing:-.01em; }
+  p { margin: 0 0 14px; }
+  code { background:#eef2ff; padding:1px 6px; border-radius:4px;
+         font:14px/1 ui-monospace,SFMono-Regular,Menlo,monospace; }
+  pre { background:#0f172a; color:#e2e8f0; padding:16px 18px; border-radius:10px;
+        overflow-x:auto; font:13.5px/1.55 ui-monospace,SFMono-Regular,Menlo,monospace; }
+  pre .c { color:#64748b; } pre .g { color:#4ade80; } pre .y { color:#facc15; }
+  pre .r { color:#f87171; }
+  table { width:100%; border-collapse:collapse; margin: 12px 0 20px; font-size:14.5px; }
+  th,td { text-align:left; padding:8px 10px; border-bottom:1px solid var(--line); }
+  th { font-weight:600; color:var(--dim); font-size:12.5px; text-transform:uppercase;
+       letter-spacing:.04em; }
+  td.num { text-align:right; font-variant-numeric: tabular-nums; }
+  .pill { display:inline-block; padding:1px 8px; border-radius:99px; font-size:12px;
+          font-weight:600; }
+  .healthy { background:#dcfce7; color:#166534; }
+  .mixed { background:#fef9c3; color:#854d0e; }
+  .unreliable { background:#fee2e2; color:#991b1b; }
+  .quota_blocked { background:#e0e7ff; color:#3730a3; }
+  .steps { display:grid; gap:14px; margin: 18px 0 8px; }
+  .step { background:#fff; border:1px solid var(--line); border-radius:10px; padding:16px 18px; }
+  .step h3 { margin:0 0 6px; font-size:16px; }
+  .step p { margin:0; color:var(--dim); font-size:14.5px; }
+  .note { background:#fff; border:1px solid var(--line); border-left:3px solid var(--accent);
+          border-radius:6px; padding:12px 16px; margin:14px 0; font-size:14.5px; }
+  ul { margin: 8px 0 16px; padding-left: 22px; }
+  li { margin: 5px 0; }
+  footer { margin-top:64px; padding-top:20px; border-top:1px solid var(--line);
+           color:var(--dim); font-size:13.5px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <h1>ModelLens</h1>
+  <p class="tag">See which of your models actually works.</p>
+
+  <p>An MCP server that turns any OpenAI-compatible gateway into an observable,
+     rankable set of models. It discovers what a provider advertises, probes what
+     works <em>right now</em> — latency, success, cancellation, streaming, tool
+     calling — keeps the history, and answers <strong>"which model should I use?"</strong></p>
+
+  <p>Zero third-party dependencies. Python 3.9+ standard library only.</p>
+
+  <h2>The problem it found on a real gateway</h2>
+
+  <p>89 models advertised. 16 probed. The default routing group was putting an
+     87-second model first and a 0.9-second model third:</p>
+
+  <table>
+    <thead><tr><th>model</th><th class="num">score</th><th class="num">success</th>
+      <th class="num">cancel</th><th class="num">median</th><th>verdict</th></tr></thead>
+    <tbody>
+      <tr><td><code>kilo/nvidia/nemotron-3.5-super-vl:free</code></td>
+        <td class="num">97.6</td><td class="num">100%</td><td class="num">0%</td>
+        <td class="num">628ms</td><td><span class="pill healthy">healthy</span></td></tr>
+      <tr><td><code>auto/beam-free</code></td>
+        <td class="num">96.6</td><td class="num">100%</td><td class="num">0%</td>
+        <td class="num">909ms</td><td><span class="pill healthy">healthy</span></td></tr>
+      <tr><td><code>longcat/LongCat-2.5</code></td>
+        <td class="num">88.4</td><td class="num">100%</td><td class="num">0%</td>
+        <td class="num">3.1s</td><td><span class="pill mixed">mixed</span></td></tr>
+      <tr><td><code>group/daily</code> <span style="color:#999">(default route)</span></td>
+        <td class="num">70.0</td><td class="num">100%</td><td class="num">0%</td>
+        <td class="num">77.3s</td><td><span class="pill mixed">mixed</span></td></tr>
+      <tr><td><code>radeon-cloud/DeepSeek-V4.1-Flash</code></td>
+        <td class="num">70.0</td><td class="num">100%</td><td class="num">0%</td>
+        <td class="num">87.4s</td><td><span class="pill mixed">mixed</span></td></tr>
+      <tr><td><code>nvidia/deepseek-ai/deepseek-v4.1-flash</code></td>
+        <td class="num">0.0</td><td class="num">0%</td><td class="num">100%</td>
+        <td class="num">—</td><td><span class="pill unreliable">unreliable</span></td></tr>
+      <tr><td><code>modelscope/Qwen/Qwen3.8-27B</code></td>
+        <td class="num">0.0</td><td class="num">0%</td><td class="num">0%</td>
+        <td class="num">—</td><td><span class="pill quota_blocked">quota</span></td></tr>
+    </tbody>
+  </table>
+
+  <h2>Install and point it at your gateway</h2>
+
+  <pre><span class="c"># 1. get it</span>
+curl -fsSL https://example.com/modellens/modellens.py -o modellens.py
+
+<span class="c"># 2. say where your models live</span>
+cat &gt; config.json &lt;&lt;EOF
+{"endpoints": [
+  {"name": "magpie", "base_url": "http://127.0.0.1:3425/v1"},
+  {"name": "openai", "base_url": "https://api.openai.com/v1", "api_key": "sk-..."}
+]}
+EOF
+
+<span class="c"># 3. probe</span>
+python3 modellens.py --config config.json --data history.json --once probe --limit 20</pre>
+
+  <h2>Or use it as an MCP server</h2>
+
+  <pre>{
+  "mcpServers": {
+    "modellens": {
+      "command": "python3",
+      "args": ["/path/to/modellens.py",
+               "--config", "/path/to/config.json",
+               "--data",   "/path/to/history.json"]
+    }
+  }
+}</pre>
+
+  <p>Works with Claude Desktop, Cursor, Windsurf, VS Code — any MCP client.</p>
+
+  <h2>Tools</h2>
+
+  <table>
+    <thead><tr><th>tool</th><th>what it does</th></tr></thead>
+    <tbody>
+      <tr><td><code>list_models</code></td><td>What each endpoint advertises</td></tr>
+      <tr><td><code>probe</code></td><td>Real requests: latency, success, streaming, tool calls</td></tr>
+      <tr><td><code>ranking</code></td><td>Quality ranking from recorded history</td></tr>
+      <tr><td><code>recommend</code></td><td>Best model for <code>fast</code> · <code>cheap</code> · <code>capable</code></td></tr>
+      <tr><td><code>report</code></td><td>The whole picture as markdown</td></tr>
+    </tbody>
+  </table>
+
+  <h2>How it scores</h2>
+
+  <p>Every probe is a real request, so the numbers are evidence, not estimates.</p>
+
+  <table>
+    <thead><tr><th>signal</th><th>weight</th><th>note</th></tr></thead>
+    <tbody>
+      <tr><td>Success rate</td><td class="num">50%</td><td>0% success ⇒ score 0, whatever else looks good</td></tr>
+      <tr><td>Median latency</td><td class="num">30%</td><td>linear to 0 at 8 s</td></tr>
+      <tr><td>Cancellation rate</td><td class="num">20%</td><td>timeouts and client cancels</td></tr>
+    </tbody>
+  </table>
+
+  <div class="note">
+    <strong>Honest notes.</strong> Probing costs tokens — each probe is a real
+    completion, so keep the limit sensible. A single probe is weak evidence;
+    the report shows <code>n=</code> so you can see the sample size. And latency
+    is measured from where you run it, so run it from where your agents run.
+  </div>
+
+  <h2>Status</h2>
+
+  <ul>
+    <li>Working today: discovery, probing, streaming and tool-call checks, scoring,
+        ranking, recommendation, markdown report, MCP stdio, CLI.</li>
+    <li>Roadmap: Anthropic and Gemini transports, per-token cost accounting,
+        alerting webhooks, hosted multi-team version.</li>
+  </ul>
+
+  <footer>
+    MIT licensed. Use it, ship it, charge for your own hosted version.
+  </footer>
+
+</div>
+</body>
+</html>

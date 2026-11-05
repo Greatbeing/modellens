@@ -1,0 +1,40 @@
+# MCP Registry server manifest
+# Docs: https://registry.modelcontextprotocol.io/docs
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-09-29/server.schema.json",
+  "name": "io.github.greatbeing/modellens",
+  "description": "Discover, probe, rank and recommend models across OpenAI-compatible gateways. Turns a model list into measured quality: latency, success rate, cancellation, streaming and tool-call support, with history.",
+  "version": "0.1.0",
+  "packages": [
+    {
+      "registryType": "git",
+      "identifier": "Greatbeing/modellens",
+      "version": "0.1.0",
+      "transport": {
+        "type": "stdio"
+      },
+      "runtimeHint": "python3",
+      "command": "python3",
+      "args": ["modellens.py", "--config", "config.json", "--data", "history.json"],
+      "environmentVariables": [
+        {
+          "name": "MODELLENS_CONFIG",
+          "description": "Path to the endpoint configuration JSON",
+          "isRequired": false,
+          "isSecret": false
+        },
+        {
+          "name": "MODELLENS_DATA",
+          "description": "Path to the probe history JSON",
+          "isRequired": false,
+          "isSecret": false
+        }
+      ],
+      "files": [
+        { "path": "modellens.py", "type": "source" },
+        { "path": "README.md", "type": "docs" },
+        { "path": "config.example.json", "type": "config" }
+      ]
+    }
+  ]
+}
