@@ -3,7 +3,7 @@
   "name": "io.github.Greatbeing/modellens",
   "title": "ModelLens",
   "description": "See which models actually work: probe, rank and recommend across OpenAI-compatible gateways.",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "repository": {
     "url": "https://github.com/Greatbeing/modellens",
     "source": "github"
@@ -12,7 +12,7 @@
     {
       "registryType": "pypi",
       "identifier": "modellens-mcp",
-      "version": "0.1.1",
+      "version": "0.1.2",
       "transport": {
         "type": "stdio"
       },
