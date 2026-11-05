@@ -43,11 +43,17 @@ model third. ModelLens found that in one pass.
 ## Install
 
 ```bash
-# Any Python 3.9+. No pip install needed.
-curl -fsSL https://example.com/modellens/modellens.py -o modellens.py
+# from PyPI
+pip install modellens
+modellens --config config.json --data history.json --once ranking
 ```
 
-Or clone and run from source.
+or straight from source — no dependencies, no install step:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/Greatbeing/modellens/main/modellens.py -o modellens.py
+python3 modellens.py --config config.json --data history.json --once ranking
+```
 
 ## Configure
 

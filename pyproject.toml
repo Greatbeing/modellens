@@ -1,0 +1,38 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "modellens"
+version = "0.1.0"
+description = "See which of your models actually works. MCP server + CLI that discovers, probes, ranks and recommends models across OpenAI-compatible gateways."
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.9"
+authors = [{ name = "Greatbeing" }]
+keywords = ["mcp", "mcp-server", "model-routing", "llm", "llm-observability", "ai-agents"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+]
+
+[project.urls]
+Homepage = "https://github.com/Greatbeing/modellens"
+Repository = "https://github.com/Greatbeing/modellens"
+Issues = "https://github.com/Greatbeing/modellens/issues"
+
+[project.scripts]
+modellens = "modellens:main"
+
+[tool.setuptools]
+py-modules = ["modellens"]

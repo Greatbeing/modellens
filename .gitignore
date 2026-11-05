@@ -6,3 +6,9 @@ out/
 .DS_Store
 *.tar.gz
 modellens-release/
+dist/
+build/
+*.egg-info/
+.eggs/
+.venv/
+venv/
