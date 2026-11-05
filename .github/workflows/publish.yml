@@ -1,9 +1,13 @@
 name: Publish to PyPI
 
-# Publishes on every GitHub release. PyPI trusts this repository through
-# Trusted Publishing (OIDC), so no long-lived API token is stored anywhere.
-# Setup: https://pypi.org/manage/account/publishing/  (add this repo + the
-# `pypi` environment + the `publish-to-pypi` workflow name)
+# Publishes on every GitHub release, authenticating with a PyPI API token
+# stored as the PYPI_API_TOKEN repository secret.
+#
+# Note: PyPI Trusted Publishing (OIDC, no stored token) did not work here —
+# the publisher entry could not be made to match GitHub's claims. If you want
+# to revisit it later: https://pypi.org/manage/account/publishing/
+#   project `modellens`, owner `Greatbeing`, repo `modellens`,
+#   workflow file `publish.yml`, environment `pypi`.
 
 on:
   release:
@@ -36,8 +40,6 @@ jobs:
     needs: build
     runs-on: ubuntu-latest
     environment: pypi
-    permissions:
-      id-token: write   # required by PyPI Trusted Publishing
     steps:
       - uses: actions/download-artifact@v4
         with:
@@ -45,7 +47,10 @@ jobs:
           path: dist/
       # Pinned to a commit, not the mutable `release/v1` tag: a compromised
       # upstream tag would otherwise run in this workflow unchanged.
+      # __token__ is the literal username PyPI expects for token auth.
       - uses: pypa/gh-action-pypi-publish@7245906fb61fa33a13554f9d5fb856fe61758086 # release/v1
+        with:
+          password: ${{ secrets.PYPI_API_TOKEN }}
 
   verify:
     needs: publish
