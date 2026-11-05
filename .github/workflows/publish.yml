@@ -61,6 +61,6 @@ jobs:
           python-version: "3.12"
       - name: Install from PyPI and smoke-test
         run: |
-          python -m pip install --upgrade modellens
+          python -m pip install --upgrade modellens-mcp
           modellens --once ranking --help >/dev/null 2>&1 || true
           python -c "import modellens; print('installed modellens', modellens.SERVER_VERSION)"
