@@ -37,7 +37,7 @@ from statistics import median
 
 PROTOCOL_VERSION = "2024-11-05"
 SERVER_NAME = "modellens"
-SERVER_VERSION = "0.1.0"
+SERVER_VERSION = "0.1.3"
 
 # How hard a probe pushes a model: enough to expose broken routing, cheap enough
 # to run often. A probe is a real request, so it costs a few tokens.
@@ -561,22 +561,60 @@ def tool_report(ctx: Context, args: dict) -> str:
 
 
 TOOLS = [
-    ("list_models", "List the models each configured endpoint advertises.",
-     {"contains": "optional substring filter", "limit": "optional max per endpoint"},
+    ("list_models",
+     "List the models each configured endpoint advertises (GET {base_url}/models). "
+     "Read-only network call to your own configured endpoints — no inference, no token cost. "
+     "Use this FIRST, before probe/ranking, to see what is available. "
+     "Returns model ids grouped by endpoint name; empty list if an endpoint is unreachable.",
+     {"contains": "optional substring filter (matches model id)",
+      "limit": "optional max models per endpoint"},
      tool_list_models),
-    ("probe", "Probe models with real requests: latency, success, streaming, tool calls.",
-     {"endpoint": "optional endpoint name", "model": "exact model id",
-      "contains": "substring filter", "limit": "max models (default 20)",
-      "check_tools": "also test function calling"},
+    ("probe",
+     "Probe models by sending REAL chat-completion requests; measures latency, success rate, "
+     "streaming and tool calling. Side effects: consumes upstream tokens/quota and hits the "
+     "network (open-world) — every probe is a real, billed completion. "
+     "Use to measure what works RIGHT NOW, then call ranking. "
+     "Returns per-model probe rows (ok, latency_ms, status, stream_ok, tools_ok).",
+     {"endpoint": "optional endpoint name to restrict probing to",
+      "model": "probe exactly this model id",
+      "contains": "substring filter on model id",
+      "limit": "max models to probe (default 20)",
+      "check_tools": "also test function calling (slower)"},
      tool_probe),
-    ("ranking", "Quality ranking built from recorded probe history.",
+    ("ranking",
+     "Return the quality ranking computed from RECORDED probe history (read-only: no network, "
+     "no new probes). Ordered best-first by score = success 50% + median latency 30% + "
+     "cancellation 20%. Use after probe to see the ranked table; use recommend for a single "
+     "best pick. Rows include model, score, success%, cancel%, median latency, verdict.",
      {"limit": "rows to show (default 30)"},
      tool_ranking),
-    ("recommend", "Best model for a task profile.",
-     {"profile": "fast | cheap | capable"},
+    ("recommend",
+     "Return the single best model for a task profile: 'fast' (lowest latency), 'cheap', or "
+     "'capable' (highest quality). Read-only, computed from recorded probe history; omit "
+     "profile to use the default. Use when you need ONE model to route to right now.",
+     {"profile": "fast | cheap | capable (optional, default = capable)"},
      tool_recommend),
-    ("report", "The whole picture as markdown.", {}, tool_report),
+    ("report",
+     "Return the whole picture as a markdown report: endpoints, verdict counts, top models by "
+     "score, and the full per-model table. Read-only, from recorded history (no network). "
+     "Use to inspect or share overall gateway health (e.g. paste into a STATUS.md).",
+     {},
+     tool_report),
 ]
+
+# MCP tool annotations (MCP spec 2025-06-18): tell agents the side-effect profile of each tool.
+TOOL_ANNOTATIONS = {
+    "list_models": {"readOnlyHint": True, "destructiveHint": False,
+                    "idempotentHint": True, "openWorldHint": True},
+    "probe":       {"readOnlyHint": False, "destructiveHint": False,
+                    "idempotentHint": False, "openWorldHint": True},
+    "ranking":     {"readOnlyHint": True, "destructiveHint": False,
+                    "idempotentHint": True, "openWorldHint": False},
+    "recommend":   {"readOnlyHint": True, "destructiveHint": False,
+                    "idempotentHint": True, "openWorldHint": False},
+    "report":      {"readOnlyHint": True, "destructiveHint": False,
+                    "idempotentHint": True, "openWorldHint": False},
+}
 
 
 # --------------------------------------------------------------------------
@@ -602,6 +640,7 @@ def handle(ctx: Context, msg: dict) -> dict | None:
     if method == "tools/list":
         return ok(msg_id, {"tools": [
             {"name": n, "description": d,
+             "annotations": TOOL_ANNOTATIONS.get(n),
              "inputSchema": {
                  "type": "object",
                  "properties": {k: {"type": "string", "description": v}

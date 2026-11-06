@@ -11,6 +11,10 @@ keeps the history, and answers **"which model should I use?"**
 
 Zero third-party dependencies. Python 3.9+ standard library only.
 
+[![Live status](https://img.shields.io/badge/status-live_probe_report-blue)](STATUS.md)
+[Glama](https://glama.ai/mcp/servers/Greatbeing/modellens)
+[PyPI](https://pypi.org/project/modellens-mcp/)
+
 ---
 
 ## Why
