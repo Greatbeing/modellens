@@ -4,15 +4,16 @@
 set -euo pipefail
 
 REPO="Greatbeing/modellens"
-ROOT="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
+ROOT="${MODELLENS_ROOT:-$(git rev-parse --show-toplevel 2>/dev/null || echo /data/workspace/modellens)}"
 STATUS_MD="$ROOT/STATUS.md"
-WORKDIR="/tmp/modellens-gh-pages-$$"
+WORKDIR="$ROOT/.deploy-tmp"
 HTML_OUT="$WORKDIR/index.html"
 REDIRECT_OUT="$WORKDIR/.nojekyll"
 
 # --- 1. sanity ---
 [[ -f "$STATUS_MD" ]] || { echo "STATUS.md not found at $STATUS_MD"; exit 1; }
-command -v pandoc >/dev/null || { echo "pandoc not installed"; exit 1; }
+PANDOC="$ROOT/tools/pandoc-3.13/pandoc.exe"
+[[ -x "$PANDOC" ]] || { echo "pandoc not found at $PANDOC"; exit 1; }
 command -v gh >/dev/null || { echo "gh not installed"; exit 1; }
 
 # --- 2. render markdown -> html (with minimal css) ---
@@ -50,9 +51,9 @@ Updated $date$
 </html>
 EOF
 
-pandoc "$STATUS_MD" -f gfm -t html --template="$WORKDIR/template.html" \
+"$PANDOC" "$STATUS_MD" -f gfm -t html --template="$WORKDIR/template.html" \
   -V date="$(date -u +'%Y-%m-%d %H:%M UTC')" \
-  -o "$HTML_OUT" 2>/dev/null || { echo "pandoc render failed"; exit 1; }
+  -o "$HTML_OUT" || { echo "pandoc render failed"; exit 1; }
 
 # .nojekyll to disable Jekyll processing
 touch "$REDIRECT_OUT"
