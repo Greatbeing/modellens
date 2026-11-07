@@ -139,6 +139,23 @@ ranking(limit=10)
 recommend(profile="fast")
 ```
 
+### Hosted / paid (x402, USDC on Base)
+
+A hosted endpoint runs the same tools over MCP streamable-HTTP and charges
+per call with [x402](https://x402.org) — agents pay gasless USDC on Base, no
+accounts or API keys:
+
+- Endpoint: `https://8000-agqz7vbdiiy6cc2n2tbs63iji4.instabox.tech/mcp`
+- Manifest: `/.well-known/x402` (payTo address, prices, facilitator)
+- Prices: `list_models` free · `ranking`/`recommend` $0.01 · `report` $0.02 · `probe` $0.05
+  (probe makes real upstream requests, so it costs the most)
+
+An unpaid paid-tool call returns `HTTP 402` + `PAYMENT-REQUIRED`; the agent
+signs an EIP-3009 USDC transfer and retries with `X-PAYMENT`, the facilitator
+verifies/settles, and the tool result comes back with a `PAYMENT-RESPONSE`.
+Self-host the same server anywhere with `python3 server_x402.py`
+(set `X402_PAY_TO` to your receiving address; see `server_x402.py` header).
+
 ---
 
 ## How it scores
