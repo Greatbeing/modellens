@@ -17,6 +17,8 @@ Zero third-party dependencies. Python 3.9+ standard library only.
 [![Glama](https://img.shields.io/badge/Glama-Modellens-orange)](https://glama.ai/mcp/servers/Greatbeing/modellens)
 [![Live status](https://img.shields.io/badge/status-live_probe_report-blue)](https://greatbeing.github.io/modellens/)
 
+- 中文落地页：[LANDING_ZH.md](LANDING_ZH.md)
+
 ---
 
 ## Why
