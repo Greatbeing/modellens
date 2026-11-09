@@ -2,6 +2,7 @@ __pycache__/
 *.pyc
 history.json
 config.json
+config.test.json
 out/
 .DS_Store
 *.tar.gz
@@ -12,3 +13,9 @@ build/
 .eggs/
 .venv/
 venv/
+.wallet.key
+.deploy-tmp/
+tools/
+worker/node_modules/
+worker/.wrangler/
+worker/$null
