@@ -222,3 +222,9 @@ MIT. Use it, ship it, charge for your own hosted version.
   probes; the report says `n=1` so you can see the sample size.
 - **Latency depends on you.** Your network, not just the provider, is in the
   measurement. Run it from where your agents run.
+
+## Hosted / paid
+
+- Hosted landing page: [`LANDING_EN.md`](LANDING_EN.md)
+- MCP server listing (MCPize): [`MCPIZE_SUBMISSION.md`](MCPIZE_SUBMISSION.md)
+- x402 buyer guide: [`X402_BUYER_GUIDE.md`](X402_BUYER_GUIDE.md)
