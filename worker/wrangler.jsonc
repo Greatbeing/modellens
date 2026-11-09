@@ -1,5 +1,5 @@
 {
-  "name": "modellens-worker",
+  "name": "modellens",
   "main": "src/index.js",
   "compatibility_date": "2025-06-01",
   "observability": { "enabled": true },
