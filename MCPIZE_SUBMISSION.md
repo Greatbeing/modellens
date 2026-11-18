@@ -45,7 +45,7 @@ Note: All paid tools are charged per call via x402 (USDC on Base). No subscripti
 
 **Category:** AI & Machine Learning
 
-**Tags:** API Testing, Monitoring, Developer Tools
+**Tags:** API Testing, Monitoring, Developer Tools, Magpie Community
 
 ## Why pay for this
 
@@ -67,5 +67,5 @@ Self-hosting Modellens is free. Use the hosted endpoint if you want managed acce
 - Endpoint: paste the hosted MCP endpoint URL
 - Manifest: paste the x402 manifest URL
 - Category: select "AI & Machine Learning"
-- Tags: add "API Testing", "Monitoring", "Developer Tools"
+- Tags: add "API Testing", "Monitoring", "Developer Tools", "Magpie Community"
 - Self-host info: mention `pip install modellens-mcp` and that self-hosting is free

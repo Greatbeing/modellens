@@ -10,7 +10,7 @@ readme = "README.md"
 license = { text = "MIT" }
 requires-python = ">=3.9"
 authors = [{ name = "Greatbeing" }]
-keywords = ["mcp", "mcp-server", "model-routing", "llm", "llm-observability", "ai-agents"]
+keywords = ["mcp", "mcp-server", "model-routing", "llm", "llm-observability", "ai-agents", "magpie-community"]
 classifiers = [
     "Development Status :: 4 - Beta",
     "Environment :: Console",
