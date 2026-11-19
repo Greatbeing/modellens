@@ -10,7 +10,10 @@ permissions:
 
 jobs:
   unit:
-    runs-on: ubuntu-latest
+    # Pinned: the current ubuntu-latest (26.04) no longer ships Python 3.9 in
+    # setup-python's cache, so the 3.9 leg failed before running any test.
+    # 24.04 still provides 3.9, and the package claims requires-python >=3.9.
+    runs-on: ubuntu-24.04
     strategy:
       fail-fast: false
       matrix:
