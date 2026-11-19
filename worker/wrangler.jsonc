@@ -1,6 +1,7 @@
 {
   "name": "modellens",
   "main": "src/index.js",
+  "workers_dev": true,
   "compatibility_date": "2025-06-01",
   "observability": { "enabled": true },
   "kv_namespaces": [
