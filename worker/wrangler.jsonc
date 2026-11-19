@@ -9,7 +9,9 @@
   "vars": {
     "X402_PAY_TO": "0x2aB8D0071b8D9d3Ac194ba10a3f8767522920d50",
     "X402_FACILITATOR": "https://x402.org/facilitator",
-    "INGEST_SECRET": "709093b60ee3b80b9cd950ac9906d972",
+    // INGEST_SECRET is a secret: set it with `wrangler secret put INGEST_SECRET`
+    // (never commit it). The previously-committed value is exposed in git history
+    // and MUST be rotated. Local dev: put it in worker/.dev.vars (gitignored).
     "BACKEND_MCP": "https://8000-agqz7vbdiiy6cc2n2tbs63iji4.instabox.tech/mcp"
   }
 }

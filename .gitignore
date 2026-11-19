@@ -18,4 +18,5 @@ venv/
 tools/
 worker/node_modules/
 worker/.wrangler/
+worker/.dev.vars
 worker/$null

@@ -156,39 +156,69 @@ async function verifyAndSettle(env, xPayment, req) {
 
 // ---- read-only tools (from KV) ----
 
-function aggregate(rows) {
-  const agg = {};
-  for (const r of rows || []) {
-    const m = r.model;
-    if (!m) continue;
-    const a = (agg[m] = agg[m] || { ok: 0, n: 0, latSum: 0, latN: 0, cancels: 0 });
-    a.n += 1;
-    if (r.ok) {
-      a.ok += 1;
-      if (typeof r.latency_ms === 'number') {
-        a.latSum += r.latency_ms;
-        a.latN += 1;
-      }
-    }
-    if (r.status === 'cancelled' || r.error === 'cancelled') a.cancels += 1;
-  }
-  const out = [];
-  for (const [m, a] of Object.entries(agg)) {
-    const succ = a.n ? (a.ok / a.n) * 100 : 0;
-    const lat = a.latN ? a.latSum / a.latN : null;
-    const score = a.n ? succ * 0.5 + (lat != null ? Math.max(0, 100 - (lat / 8000) * 100) * 0.3 : 0) + (100 - (a.cancels / a.n) * 100) * 0.2 : 0;
-    out.push({ model: m, score: +score.toFixed(1), success: +succ.toFixed(1), latency: lat, n: a.n });
-  }
-  out.sort((a, b) => b.score - a.score || (a.latency ?? 1e9) - (b.latency ?? 1e9));
-  return out;
+// Scoring mirrors modellens.py score_model exactly: median latency (not mean),
+// cancellation = status 0/499 (not a 'cancelled' string), score 0 on 0% success,
+// and dead/quota_blocked verdicts. The hosted worker must not drift from the
+// CLI/MCP core — same data must yield the same numbers.
+function median(arr) {
+  if (!arr.length) return null;
+  const s = [...arr].sort((a, b) => a - b);
+  const m = Math.floor(s.length / 2);
+  return s.length % 2 ? s[m] : (s[m - 1] + s[m]) / 2;
 }
 
-function verdict(r) {
-  if (r.success >= 95 && (r.latency ?? 0) < 3000) return 'healthy';
-  if (r.success === 0 && r.n > 0) return 'unreliable';
-  if (r.success < 50) return 'unreliable';
-  if (r.success < 95) return 'mixed';
-  return 'healthy';
+// Match Python round(x, 1) for the decision fields (score / success / cancel).
+// toFixed correctly rounds the actual binary value; at an exact .5 tenth apply
+// ties-to-even like Python. The x*10 tie test is only reliable below ~1000 —
+// above that, float ulp makes x*10 land on .5 spuriously — so large medians fall
+// back to toFixed. Those can differ from Python by <=0.1ms at exact representable
+// ties: a display-only nuance that never affects score, ranking or recommendation.
+function round1(x) {
+  const s = x * 10, f = Math.floor(s);
+  if (x < 1000 && s - f === 0.5) return (f % 2 === 0 ? f : f + 1) / 10;
+  return Number(x.toFixed(1));
+}
+
+function scoreModel(rows) {
+  const attempts = rows.length;
+  const oks = rows.filter((r) => r.ok);
+  const cancelled = rows.filter((r) => !r.ok && (r.status === 0 || r.status === 499)).length;
+  const latencies = oks.map((r) => r.latency_ms).filter((x) => typeof x === 'number');
+  const success_rate = attempts ? (oks.length / attempts) * 100 : 0;
+  const cancel_rate = attempts ? (cancelled / attempts) * 100 : 0;
+  const med = median(latencies);
+
+  let verdict;
+  if (attempts === 0) verdict = 'untested';
+  else if (success_rate === 0 && rows.every((r) => r.status === 404)) verdict = 'dead';
+  else if (success_rate === 0 && rows.every((r) => r.status === 429)) verdict = 'quota_blocked';
+  else if (cancel_rate >= 30) verdict = 'unreliable';
+  else if (success_rate >= 95 && (med == null ? 9e9 : med) < 3000) verdict = 'healthy';
+  else verdict = 'mixed';
+
+  if (attempts === 0 || success_rate === 0) {
+    return { attempts, ok: 0, failed: attempts, cancelled, success_rate: 0,
+             cancel_rate: round1(cancel_rate), median_latency_ms: null, score: 0, verdict };
+  }
+  const latency_score = Math.max(0, Math.min(1, 1 - med / 8000)) * 100;
+  const score = (success_rate * 50 + latency_score * 30 + Math.max(0, 100 - cancel_rate * 2) * 20) / 100;
+  return { attempts, ok: oks.length, failed: attempts - oks.length, cancelled,
+           success_rate: round1(success_rate), cancel_rate: round1(cancel_rate),
+           median_latency_ms: med == null ? null : round1(med), score: round1(score), verdict };
+}
+
+function aggregate(rows) {
+  const byModel = {};
+  for (const r of rows || []) {
+    if (!r.model) continue;
+    (byModel[r.model] = byModel[r.model] || []).push(r);
+  }
+  const out = [];
+  for (const [m, rs] of Object.entries(byModel)) out.push({ model: m, ...scoreModel(rs) });
+  out.sort((a, b) => b.score - a.score
+    || (a.median_latency_ms ?? 1e12) - (b.median_latency_ms ?? 1e12)
+    || a.model.localeCompare(b.model));
+  return out;
 }
 
 async function toolListModels(env, args) {
@@ -206,12 +236,12 @@ async function toolListModels(env, args) {
 async function toolRanking(env, args) {
   const raw = await env.DATA.get('history');
   if (!raw) return 'no probe history yet';
-  const h = JSON.parse(raw);
-  const rows = aggregate(h.rows);
+  const rows = aggregate(JSON.parse(raw).rows);
   const limit = parseInt(args.limit || '30', 10);
-  const top = rows.slice(0, limit);
-  const lines = ['| model | score | success | median | n | verdict |', '| --- | --- | --- | --- | --- | --- |'];
-  for (const r of top) lines.push(`| ${r.model} | ${r.score} | ${r.success}% | ${r.latency != null ? Math.round(r.latency) + 'ms' : '-'} | ${r.n} | ${verdict(r)} |`);
+  const lines = ['| model | score | success | cancel | median | n | verdict |', '| --- | --- | --- | --- | --- | --- | --- |'];
+  for (const r of rows.slice(0, limit)) {
+    lines.push(`| ${r.model} | ${r.score} | ${r.success_rate}% | ${r.cancel_rate}% | ${r.median_latency_ms != null ? Math.round(r.median_latency_ms) + 'ms' : '-'} | ${r.attempts} | ${r.verdict} |`);
+  }
   return lines.join('\n');
 }
 
@@ -219,16 +249,24 @@ async function toolRecommend(env, args) {
   const raw = await env.DATA.get('history');
   if (!raw) return 'no probe history yet';
   const rows = aggregate(JSON.parse(raw).rows);
-  if (!rows.length) return 'no data';
+  let usable = rows.filter((r) => r.score > 0 && r.verdict !== 'dead' && r.verdict !== 'quota_blocked');
+  if (!usable.length) return 'no model has a passing score yet';
   const profile = (args.profile || 'capable').trim().toLowerCase();
-  let pick;
+  let note = '';
   if (profile === 'fast') {
-    const withLat = rows.filter((r) => r.latency != null);
-    pick = withLat.sort((a, b) => a.latency - b.latency)[0];
+    const ok = usable.filter((r) => r.success_rate >= 90);
+    if (!ok.length) return "no model meets the 90% success bar for 'fast'";
+    ok.sort((a, b) => (a.median_latency_ms ?? 1e12) - (b.median_latency_ms ?? 1e12));
+    usable = ok;
+  } else if (profile === 'cheap') {
+    usable.sort((a, b) => b.success_rate - a.success_rate || (a.median_latency_ms ?? 1e12) - (b.median_latency_ms ?? 1e12));
+    note = '\n\nNo pricing in snapshot; fell back to reliability then latency (true cost not collected).';
   } else {
-    pick = rows[0];
+    usable.sort((a, b) => b.score - a.score || (a.median_latency_ms ?? 1e12) - (b.median_latency_ms ?? 1e12));
   }
-  return `**Recommended (${profile}): \`${pick.model}\`** — score ${pick.score}, success ${pick.success}%${pick.latency != null ? ', median ' + Math.round(pick.latency) + 'ms' : ''}, verdict ${verdict(pick)} (n=${pick.n}).\n\nRunner-up: ${rows[1] ? '`' + rows[1].model + '` (score ' + rows[1].score + ')' : 'n/a'}.`;
+  const pick = usable[0];
+  const runner = usable[1];
+  return `**Recommended (${profile}): \`${pick.model}\`** — score ${pick.score}, success ${pick.success_rate}%${pick.median_latency_ms != null ? ', median ' + Math.round(pick.median_latency_ms) + 'ms' : ''}, verdict ${pick.verdict} (n=${pick.attempts}).\n\nRunner-up: ${runner ? '`' + runner.model + '` (score ' + runner.score + ')' : 'n/a'}.${note}`;
 }
 
 async function toolReport(env) {
@@ -236,8 +274,8 @@ async function toolReport(env) {
   if (!raw) return 'no probe history yet';
   const h = JSON.parse(raw);
   const rows = aggregate(h.rows);
-  const counts = { healthy: 0, mixed: 0, unreliable: 0 };
-  for (const r of rows) counts[verdict(r)] = (counts[verdict(r)] || 0) + 1;
+  const counts = {};
+  for (const r of rows) counts[r.verdict] = (counts[r.verdict] || 0) + 1;
   const lines = [
     '# ModelLens report',
     '',
@@ -246,13 +284,13 @@ async function toolReport(env) {
     `- probes recorded: ${(h.rows || []).length}`,
     '',
     '## Verdicts',
-    ...Object.entries(counts).map(([k, v]) => `- ${k}: ${v}`),
+    ...['healthy', 'mixed', 'unreliable', 'quota_blocked', 'dead', 'untested'].filter((k) => counts[k]).map((k) => `- ${k}: ${counts[k]}`),
     '',
     '## Top 15 by score',
     '',
-    '| model | score | success | median | n | verdict |',
-    '| --- | --- | --- | --- | --- | --- |',
-    ...rows.slice(0, 15).map((r) => `| ${r.model} | ${r.score} | ${r.success}% | ${r.latency != null ? Math.round(r.latency) + 'ms' : '-'} | ${r.n} | ${verdict(r)} |`),
+    '| model | score | success | cancel | median | n | verdict |',
+    '| --- | --- | --- | --- | --- | --- | --- |',
+    ...rows.slice(0, 15).map((r) => `| ${r.model} | ${r.score} | ${r.success_rate}% | ${r.cancel_rate}% | ${r.median_latency_ms != null ? Math.round(r.median_latency_ms) + 'ms' : '-'} | ${r.attempts} | ${r.verdict} |`),
     '',
     `_Snapshot pushed ${h.updated_at || 'unknown'}_`,
   ];
@@ -295,7 +333,7 @@ async function handleMcp(env, req, msg) {
     return jsonrpc(id, {
       protocolVersion: '2025-06-18',
       capabilities: { tools: {} },
-      serverInfo: { name: 'modellens-x402', version: '0.1.3' },
+      serverInfo: { name: 'modellens-x402', version: '0.1.4' },
     });
   }
   if (method && method.startsWith('notifications/')) return null;
@@ -362,12 +400,13 @@ export default {
     }
 
     if (url.pathname === '/health' && req.method === 'GET') {
-      return Response.json({ ok: true, server: 'modellens-x402-worker', version: '0.1.3' });
+      return Response.json({ ok: true, server: 'modellens-x402-worker', version: '0.1.4' });
     }
 
     // ingest: being pushes history + models snapshots
     if (url.pathname === '/ingest' && req.method === 'POST') {
-      if (req.headers.get('X-Ingest-Secret') !== env.INGEST_SECRET) {
+      const secret = env.INGEST_SECRET;
+      if (!secret || req.headers.get('X-Ingest-Secret') !== secret) {
         return new Response('unauthorized', { status: 401 });
       }
       const body = await req.json();
@@ -391,3 +430,6 @@ export default {
     return new Response('not found', { status: 404 });
   },
 };
+
+// Named exports for unit tests (wrangler only uses the default export).
+export { median, scoreModel, aggregate, round1 };

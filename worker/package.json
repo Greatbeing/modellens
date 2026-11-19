@@ -1,4 +1,8 @@
 {
+  "type": "module",
+  "scripts": {
+    "test": "node --test"
+  },
   "devDependencies": {
     "wrangler": "^4.158.0"
   }

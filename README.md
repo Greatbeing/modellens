@@ -254,6 +254,13 @@ python -m unittest discover -s tests -v
 recommendations, discovery/pricing parsing, and the MCP wire protocol. CI runs
 the same suite on Python 3.9 and 3.12 on every push and PR.
 
+The hosted Cloudflare Worker (`worker/`) serves the read-only tools from KV; its
+scoring is kept in lock-step with `modellens.py` (median latency, cancellation =
+status 0/499, score 0 on 0% success, same verdicts). `worker/test/scoring.test.mjs`
+pins this — run `node --test` in `worker/`. Deploying the worker requires
+`wrangler secret put INGEST_SECRET`; the secret is not committed (and any value
+previously committed must be rotated).
+
 ## Hosted / paid
 
 - Hosted landing page: [`LANDING_EN.md`](LANDING_EN.md)

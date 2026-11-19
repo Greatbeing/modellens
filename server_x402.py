@@ -45,6 +45,15 @@ PRICES = {  # atomic USDC (6 decimals); 0 = free
 
 CTX = ml.Context(os.environ.get("MODELLENS_CONFIG", ""), os.environ.get("MODELLENS_DATA", ""))
 
+MAX_BODY = 1_000_000  # bytes; a JSON-RPC call is tiny, cap to avoid memory abuse
+
+
+def _tool_fn(name):
+    for n, _, _, fn in ml.TOOLS:
+        if n == name:
+            return fn
+    return None
+
 
 def b64url(data: bytes) -> str:
     return base64.urlsafe_b64encode(data).rstrip(b"=").decode()
@@ -134,6 +143,11 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def _resource(self):
+        proto = self.headers.get("X-Forwarded-Proto") or "http"
+        host = self.headers.get("Host", "localhost")
+        return f"{proto}://{host}/mcp"
+
     def do_GET(self):
         if self.path.startswith("/.well-known/x402"):
             manifest = {
@@ -143,7 +157,7 @@ class Handler(BaseHTTPRequestHandler):
                 "asset": USDC_BASE,
                 "payTo": PAY_TO,
                 "facilitator": FACILITATOR,
-                "endpoint": f"http://{self.headers.get('Host', 'localhost')}/mcp",
+                "endpoint": self._resource(),
                 "tools": {t["name"]: t["x402Price"] for t in tool_spec()},
             }
             self._json(200, manifest)
@@ -156,7 +170,14 @@ class Handler(BaseHTTPRequestHandler):
         if not self.path.startswith("/mcp"):
             self._json(404, {"error": "not found"})
             return
-        length = int(self.headers.get("Content-Length") or 0)
+        try:
+            length = int(self.headers.get("Content-Length") or 0)
+        except ValueError:
+            self._json(400, {"error": "bad content-length"})
+            return
+        if length < 0 or length > MAX_BODY:
+            self._json(413, {"error": "request body too large"})
+            return
         try:
             msg = json.loads(self.rfile.read(length) or b"{}")
         except Exception:
@@ -183,10 +204,16 @@ class Handler(BaseHTTPRequestHandler):
             self._json(200, {"jsonrpc": "2.0", "id": mid, "result": {"tools": tool_spec()}})
             return
         if method == "tools/call":
-            name = (msg.get("params") or {}).get("name")
-            args = (msg.get("params") or {}).get("arguments") or {}
+            params = msg.get("params") or {}
+            name = params.get("name")
+            args = params.get("arguments") or {}
+            fn = _tool_fn(name)
+            if fn is None:
+                self._json(200, {"jsonrpc": "2.0", "id": mid,
+                                 "error": {"code": -32602, "message": f"unknown tool: {name}"}})
+                return
             price = int(PRICES.get(name, "0"))
-            resource = f"http://{self.headers.get('Host', 'localhost')}/mcp"
+            resource = self._resource()
             if price > 0:
                 xpay = self.headers.get("X-PAYMENT") or self.headers.get("X-Payment")
                 req = payment_requirements(str(price), resource, f"ModelLens {name}")
@@ -199,44 +226,32 @@ class Handler(BaseHTTPRequestHandler):
                     return
                 res = verify_and_settle(xpay, req)
                 if not res["ok"]:
-                    body = {"jsonrpc": "2.0", "id": mid, "error": {"code": 402, "message": res["error"]}}
-                    self._json(402, body)
+                    self._json(402, {"jsonrpc": "2.0", "id": mid,
+                                     "error": {"code": 402, "message": res["error"]}})
                     return
-                # run the tool
-                for n, _, _, fn in ml.TOOLS:
-                    if n == name:
-                        try:
-                            text = fn(CTX, args)
-                        except Exception as e:
-                            self._json(200, {"jsonrpc": "2.0", "id": mid,
-                                             "result": {"content": [{"type": "text", "text": f"tool error: {e}"}],
-                                                        "isError": True}})
-                            return
-                        pay_resp = b64url(json.dumps({"x402Version": 1, "transaction": res["tx"],
-                                                      "network": NETWORK}).encode())
-                        self._json(200, {"jsonrpc": "2.0", "id": mid,
-                                         "result": {"content": [{"type": "text", "text": text}]}},
-                                   {"PAYMENT-RESPONSE": pay_resp})
-                        return
+                try:
+                    text = fn(CTX, args)
+                except Exception as e:
+                    self._json(200, {"jsonrpc": "2.0", "id": mid,
+                                     "result": {"content": [{"type": "text", "text": f"tool error: {e}"}],
+                                                "isError": True}})
+                    return
+                pay_resp = b64url(json.dumps({"x402Version": 1, "transaction": res["tx"],
+                                              "network": NETWORK}).encode())
                 self._json(200, {"jsonrpc": "2.0", "id": mid,
-                                 "result": {"content": [{"type": "text", "text": "unknown tool"}],
-                                            "isError": True}})
+                                 "result": {"content": [{"type": "text", "text": text}]}},
+                           {"PAYMENT-RESPONSE": pay_resp})
                 return
             # free tool
-            for n, _, _, fn in ml.TOOLS:
-                if n == name:
-                    try:
-                        text = fn(CTX, args)
-                    except Exception as e:
-                        self._json(200, {"jsonrpc": "2.0", "id": mid,
-                                         "result": {"content": [{"type": "text", "text": f"tool error: {e}"}],
-                                                    "isError": True}})
-                        return
-                    self._json(200, {"jsonrpc": "2.0", "id": mid,
-                                     "result": {"content": [{"type": "text", "text": text}]}})
-                    return
+            try:
+                text = fn(CTX, args)
+            except Exception as e:
+                self._json(200, {"jsonrpc": "2.0", "id": mid,
+                                 "result": {"content": [{"type": "text", "text": f"tool error: {e}"}],
+                                            "isError": True}})
+                return
             self._json(200, {"jsonrpc": "2.0", "id": mid,
-                             "result": {"content": [{"type": "text", "text": "unknown tool"}], "isError": True}})
+                             "result": {"content": [{"type": "text", "text": text}]}})
             return
         self._json(200, {"jsonrpc": "2.0", "id": mid, "error": {"code": -32601, "message": "method not found"}})
 

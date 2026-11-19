@@ -29,3 +29,11 @@ jobs:
         run: |
           python modellens.py --version
           python modellens.py --once ranking
+
+  worker:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Worker scoring tests (node:test, zero deps)
+        run: node --test
+        working-directory: worker
