@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import sys
 import time
@@ -37,19 +38,21 @@ from statistics import median
 
 PROTOCOL_VERSION = "2024-11-05"
 SERVER_NAME = "modellens"
-SERVER_VERSION = "0.1.3"
+SERVER_VERSION = "0.1.4"
 
 # How hard a probe pushes a model: enough to expose broken routing, cheap enough
 # to run often. A probe is a real request, so it costs a few tokens.
 PROBE_PROMPT = "Reply with exactly: OK"
 PROBE_MAX_TOKENS = 512
 PROBE_TIMEOUT = 90
+PROBE_WORKERS_DEFAULT = 1  # sequential by default: concurrent probes can self-induce 429s
 
 # Scoring weights for the 0-100 quality score.
 W_SUCCESS = 50.0
 W_LATENCY = 30.0
 W_CANCEL = 20.0
 LATENCY_REFERENCE_MS = 8000.0  # a median at or above this scores 0 on latency
+FAST_MIN_SUCCESS = 90.0  # 'fast' only routes to models at or above this success rate
 
 
 # --------------------------------------------------------------------------
@@ -124,22 +127,56 @@ class Endpoint:
         return {"Authorization": f"Bearer {self.api_key or 'modellens'}"}
 
 
-def discover_models(ep: Endpoint) -> list[str]:
+def _parse_pricing(item: dict) -> dict:
+    """Best-effort read of per-million-token pricing from a /models entry.
+
+    Providers disagree on the field name and shape. Anything we cannot read is
+    reported as None so `cheap` can fall back honestly instead of guessing.
+    """
+    raw = item.get("priced") or item.get("pricing") or {}
+    if not isinstance(raw, dict):
+        return {"input": None, "output": None}
+
+    def num(v):
+        try:
+            f = float(v)
+            return f if f >= 0 else None
+        except (TypeError, ValueError):
+            return None
+
+    return {"input": num(raw.get("input")), "output": num(raw.get("output"))}
+
+
+def discover_models_detailed(ep: Endpoint) -> list[dict]:
+    """Advertised models with optional pricing metadata: [{id, pricing}]."""
     status, body, _ = _get(ep.models_url, timeout=20, headers=ep.headers())
     if status != 200 or not isinstance(body, dict):
         return []
     data = body.get("data")
     if not isinstance(data, list):
         return []
-    ids = []
+    found: list[dict] = []
+    seen: set[str] = set()
     for item in data:
         if isinstance(item, dict) and item.get("id"):
-            ids.append(str(item["id"]))
+            mid = str(item["id"])
+            pricing = _parse_pricing(item)
         elif isinstance(item, str):
-            ids.append(item)
-    if ep.models_filter:
-        ids = [i for i in ids if any(f in i for f in ep.models_filter)]
-    return sorted(set(ids))
+            mid, pricing = item, {"input": None, "output": None}
+        else:
+            continue
+        if mid in seen:
+            continue
+        if ep.models_filter and not any(f in mid for f in ep.models_filter):
+            continue
+        seen.add(mid)
+        found.append({"id": mid, "pricing": pricing})
+    found.sort(key=lambda d: d["id"])
+    return found
+
+
+def discover_models(ep: Endpoint) -> list[str]:
+    return [d["id"] for d in discover_models_detailed(ep)]
 
 
 # --------------------------------------------------------------------------
@@ -341,8 +378,9 @@ def score_model(rows: list[dict]) -> dict:
         "success_rate": round(success_rate, 1),
         "cancel_rate": round(cancel_rate, 1),
         "median_latency_ms": round(med, 1) if med is not None else None,
-        "p95_latency_ms": round(sorted(latencies)[int(len(latencies) * 0.95) - 1], 1)
-                            if len(latencies) >= 20 else None,
+        "p95_latency_ms": round(
+            sorted(latencies)[max(0, math.ceil(len(latencies) * 0.95) - 1)], 1)
+            if len(latencies) >= 20 else None,
         "score": round(score, 1),
         "verdict": verdict,
     }
@@ -353,9 +391,11 @@ def build_ranking(store: Store, endpoints: list[Endpoint]) -> list[dict]:
     for ep in endpoints:
         if not ep.enabled:
             continue
-        for mid in discover_models(ep):
+        for info in discover_models_detailed(ep):
+            mid = info["id"]
             key = f"{ep.name}/{mid}"
-            models[key] = {"endpoint": ep.name, "model": mid, "id": key}
+            models[key] = {"endpoint": ep.name, "model": mid, "id": key,
+                           "pricing": info["pricing"]}
     out = []
     for key, info in models.items():
         stats = score_model(store.for_model(info["endpoint"], info["model"]))
@@ -365,26 +405,53 @@ def build_ranking(store: Store, endpoints: list[Endpoint]) -> list[dict]:
 
 
 PROFILE_HINTS = {
-    "fast": "lowest median latency, success rate at least 90%",
-    "cheap": "any provider that reports zero pricing; otherwise prefer open-weight",
-    "capable": "highest success rate, then lowest latency",
+    "fast": f"lowest median latency among models with success rate >= {FAST_MIN_SUCCESS:.0f}%",
+    "cheap": "zero-priced models when the endpoint advertises pricing; otherwise "
+             "reliability then latency (true per-token cost is not collected)",
+    "capable": "highest quality score, then lowest latency",
 }
+
+
+def _zero_priced(row: dict) -> bool:
+    p = row.get("pricing") or {}
+    return p.get("input") == 0 and p.get("output") == 0
 
 
 def recommend(ranking: list[dict], profile: str) -> dict:
     profile = (profile or "capable").lower()
-    usable = [r for r in ranking if r["score"] > 0 and r["verdict"] not in ("dead", "quota_blocked")]
+    usable = [r for r in ranking
+              if r["score"] > 0 and r["verdict"] not in ("dead", "quota_blocked")]
+    note = None
+    criteria = PROFILE_HINTS.get(profile, PROFILE_HINTS["capable"])
     if not usable:
-        return {"profile": profile, "picks": [], "note": "no model has a passing score yet"}
+        return {"profile": profile, "criteria": criteria, "picks": [],
+                "note": "no model has a passing score yet"}
+
     if profile == "fast":
-        usable.sort(key=lambda r: (r["median_latency_ms"] if r["median_latency_ms"] is not None else 1e12))
+        fast_ok = [r for r in usable if r["success_rate"] >= FAST_MIN_SUCCESS]
+        if not fast_ok:
+            return {"profile": profile, "criteria": criteria, "picks": [],
+                    "note": f"no model meets the {FAST_MIN_SUCCESS:.0f}% success bar for 'fast'"}
+        fast_ok.sort(key=lambda r: (r["median_latency_ms"]
+                                    if r["median_latency_ms"] is not None else 1e12))
+        usable = fast_ok
     elif profile == "cheap":
-        usable.sort(key=lambda r: (-r["success_rate"], r["median_latency_ms"] or 1e12))
+        free = [r for r in usable if _zero_priced(r)]
+        if free:
+            free.sort(key=lambda r: (-r["success_rate"], r["median_latency_ms"] or 1e12))
+            usable = free
+            note = "zero-priced models (endpoint advertises $0 input/output)"
+        else:
+            usable.sort(key=lambda r: (-r["success_rate"], r["median_latency_ms"] or 1e12))
+            note = ("no zero-priced model advertised; fell back to reliability then "
+                    "latency - true per-token cost is not collected")
     else:
         usable.sort(key=lambda r: (-r["score"], r["median_latency_ms"] or 1e12))
+
     return {
         "profile": profile,
-        "criteria": PROFILE_HINTS.get(profile, PROFILE_HINTS["capable"]),
+        "criteria": criteria,
+        "note": note,
         "picks": [
             {"rank": i + 1, "id": r["id"], "score": r["score"],
              "median_latency_ms": r["median_latency_ms"],
@@ -441,12 +508,23 @@ def tool_list_models(ctx: Context, args: dict) -> str:
     return "\n".join(lines).rstrip()
 
 
+def _probe_one(ep: Endpoint, model: str, check_tools: bool) -> dict:
+    row = probe_model(ep, model)
+    if check_tools and row["ok"]:
+        row["tools_ok"] = probe_tools(ep, model)
+    mark = "ok" if row["ok"] else f"FAIL({row['status']})"
+    extra = f" tools={'yes' if row.get('tools_ok') else 'no'}" if check_tools else ""
+    print(f"  {ep.name}/{model}: {mark} {row['latency_ms']}ms{extra}", file=sys.stderr)
+    return row
+
+
 def tool_probe(ctx: Context, args: dict) -> str:
     endpoint = (args.get("endpoint") or "").strip()
     model = (args.get("model") or "").strip()
     contains = (args.get("contains") or "").strip().lower()
     limit = int(args.get("limit") or 20)
     check_tools = bool(args.get("check_tools"))
+    workers = max(1, int(args.get("workers") or PROBE_WORKERS_DEFAULT))
 
     targets: list[tuple[Endpoint, str]] = []
     for ep in ctx.endpoints:
@@ -464,15 +542,12 @@ def tool_probe(ctx: Context, args: dict) -> str:
     if not targets:
         return "No models matched. Check endpoint name / model / contains."
 
-    results = []
-    for ep, m in targets:
-        row = probe_model(ep, m)
-        if check_tools and row["ok"]:
-            row["tools_ok"] = probe_tools(ep, m)
-        results.append(row)
-        mark = "ok" if row["ok"] else f"FAIL({row['status']})"
-        extra = f" tools={'yes' if row.get('tools_ok') else 'no'}" if check_tools else ""
-        print(f"  {ep.name}/{m}: {mark} {row['latency_ms']}ms{extra}", file=sys.stderr)
+    if workers > 1:
+        from concurrent.futures import ThreadPoolExecutor
+        with ThreadPoolExecutor(max_workers=workers) as ex:
+            results = list(ex.map(lambda t: _probe_one(t[0], t[1], check_tools), targets))
+    else:
+        results = [_probe_one(ep, m, check_tools) for ep, m in targets]
 
     ctx.store.add(results)
     ctx.store.save()
@@ -527,6 +602,8 @@ def tool_recommend(ctx: Context, args: dict) -> str:
         med = f"{p['median_latency_ms']:.0f}ms" if p["median_latency_ms"] is not None else "-"
         lines.append(f"{p['rank']}. {p['id']} — score {p['score']}, "
                      f"success {p['success_rate']}%, median {med}, {p['verdict']} (n={p['attempts']})")
+    if res.get("note"):
+        lines += ["", res["note"]]
     return "\n".join(lines)
 
 
@@ -579,25 +656,31 @@ TOOLS = [
       "model": "probe exactly this model id",
       "contains": "substring filter on model id",
       "limit": "max models to probe (default 20)",
-      "check_tools": "also test function calling (slower)"},
+      "check_tools": "also test function calling (slower)",
+      "workers": "parallel probe workers (default 1 = sequential; >1 is faster but "
+                 "can self-induce 429s that misread model quality)"},
      tool_probe),
     ("ranking",
-     "Return the quality ranking computed from RECORDED probe history (read-only: no network, "
-     "no new probes). Ordered best-first by score = success 50% + median latency 30% + "
-     "cancellation 20%. Use after probe to see the ranked table; use recommend for a single "
-     "best pick. Rows include model, score, success%, cancel%, median latency, verdict.",
+     "Return the quality ranking computed from RECORDED probe history (read-only scoring; "
+     "also does a live read-only GET of each endpoint's /models list — no inference, no new "
+     "probes, no token cost). Ordered best-first by score = success 50% + median latency 30% + "
+     "cancellation 20%. Use after probe to see the ranked table; use recommend for a routing "
+     "pick. Rows include model, score, success%, cancel%, median latency, verdict.",
      {"limit": "rows to show (default 30)"},
      tool_ranking),
     ("recommend",
-     "Return the single best model for a task profile: 'fast' (lowest latency), 'cheap', or "
-     "'capable' (highest quality). Read-only, computed from recorded probe history; omit "
-     "profile to use the default. Use when you need ONE model to route to right now.",
+     "Return the best model(s) for a task profile: 'fast' (lowest latency among models with "
+     ">=90% success), 'cheap' (zero-priced when the endpoint advertises pricing, else a "
+     "reliability fallback), or 'capable' (highest score). Read-only: scores from recorded "
+     "history plus a live read-only /models GET; omit profile to use the default. Use when you "
+     "need ONE model to route to right now.",
      {"profile": "fast | cheap | capable (optional, default = capable)"},
      tool_recommend),
     ("report",
      "Return the whole picture as a markdown report: endpoints, verdict counts, top models by "
-     "score, and the full per-model table. Read-only, from recorded history (no network). "
-     "Use to inspect or share overall gateway health (e.g. paste into a STATUS.md).",
+     "score, and the full per-model table. Read-only scoring plus live read-only /models "
+     "discovery (no inference, no token cost). Use to inspect or share overall gateway health "
+     "(e.g. paste into a STATUS.md).",
      {},
      tool_report),
 ]
@@ -608,12 +691,15 @@ TOOL_ANNOTATIONS = {
                     "idempotentHint": True, "openWorldHint": True},
     "probe":       {"readOnlyHint": False, "destructiveHint": False,
                     "idempotentHint": False, "openWorldHint": True},
+    # ranking/recommend/report score from recorded history but still GET each
+    # endpoint's advertised /models list, so they are read-only yet open-world
+    # (no inference, no token cost, no writes).
     "ranking":     {"readOnlyHint": True, "destructiveHint": False,
-                    "idempotentHint": True, "openWorldHint": False},
+                    "idempotentHint": True, "openWorldHint": True},
     "recommend":   {"readOnlyHint": True, "destructiveHint": False,
-                    "idempotentHint": True, "openWorldHint": False},
+                    "idempotentHint": True, "openWorldHint": True},
     "report":      {"readOnlyHint": True, "destructiveHint": False,
-                    "idempotentHint": True, "openWorldHint": False},
+                    "idempotentHint": True, "openWorldHint": True},
 }
 
 
@@ -711,6 +797,8 @@ def run_once(ctx: Context, tool: str, args: dict) -> int:
 
 def main() -> int:
     ap = argparse.ArgumentParser(description="ModelLens MCP server")
+    ap.add_argument("--version", action="version",
+                    version=f"modellens {SERVER_VERSION}")
     ap.add_argument("--config", default=os.environ.get("MODELLENS_CONFIG", ""),
                     help="path to config.json")
     ap.add_argument("--data", default=os.environ.get("MODELLENS_DATA", ""),

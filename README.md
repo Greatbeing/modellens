@@ -16,6 +16,7 @@ Zero third-party dependencies. Python 3.9+ standard library only.
 [![MCP Registry](https://img.shields.io/badge/MCP%20Registry-io.github.Greatbeing%2Fmodellens-blue)](https://registry.modelcontextprotocol.io/servers/io.github.Greatbeing/modellens)
 [![Glama](https://img.shields.io/badge/Glama-Modellens-orange)](https://glama.ai/mcp/servers/Greatbeing/modellens)
 [![Live status](https://img.shields.io/badge/status-live_probe_report-blue)](https://greatbeing.github.io/modellens/)
+[![Tests](https://github.com/Greatbeing/modellens/actions/workflows/test.yml/badge.svg)](https://github.com/Greatbeing/modellens/actions/workflows/test.yml)
 
 - 中文落地页：[LANDING_ZH.md](LANDING_ZH.md)
 
@@ -128,10 +129,13 @@ Then restart `dsh web`. Verified: the server runs as a child process of
 | Tool | What it does |
 |---|---|
 | `list_models` | What each endpoint advertises (optional substring filter) |
-| `probe` | Real requests: latency, success, streaming, tool calls |
+| `probe` | Real requests: latency, success, streaming, tool calls (`workers` optional) |
 | `ranking` | Quality ranking from recorded history |
-| `recommend` | Best model for a profile: `fast` \| `cheap` \| `capable` |
+| `recommend` | Best model for a profile: `fast` (≥90% success) \| `cheap` (zero-priced if advertised) \| `capable` |
 | `report` | The whole picture as markdown |
+
+`ranking` / `recommend` / `report` score from recorded history but also do a
+live read-only `GET /models` on each endpoint (no inference, no token cost).
 
 ### Example
 
@@ -140,6 +144,9 @@ probe(limit=20, check_tools=true)
 ranking(limit=10)
 recommend(profile="fast")
 ```
+
+`probe(workers=4)` runs probes concurrently (faster, but see the honest notes:
+concurrency can self-induce 429s). Default is `workers=1` — sequential.
 
 ### Hosted / paid (x402, USDC on Base)
 
@@ -205,8 +212,8 @@ Working today: discovery, probing, streaming/tool-call checks, scoring, ranking,
 recommendation, markdown report, MCP stdio transport, CLI.
 
 Roadmap: OpenAI-compatible `/v1/models` only for now; Anthropic and Gemini
-transports, per-endpoint cost accounting, alerting webhooks, and a hosted
-multi-team version.
+transports, richer per-token cost accounting across more gateway field shapes,
+alerting webhooks, and a hosted multi-team version.
 
 ---
 
@@ -224,6 +231,28 @@ MIT. Use it, ship it, charge for your own hosted version.
   probes; the report says `n=1` so you can see the sample size.
 - **Latency depends on you.** Your network, not just the provider, is in the
   measurement. Run it from where your agents run.
+- **`fast` keeps a ≥90% success bar.** If nothing qualifies it says so instead
+  of handing you a flaky "fast" model.
+- **`cheap` is honest about pricing.** It prefers models the endpoint advertises
+  as $0 input/output; when no pricing is advertised it falls back to reliability
+  then latency and says so — true per-token cost is not collected.
+- **Probing is sequential by default.** `workers>1` is faster, but concurrent
+  probes can self-induce 429s that misread a model's real quality.
+- **`ranking`/`recommend`/`report` are read-only but not offline.** They GET
+  each endpoint's `/models` list live (no inference, no token cost).
+
+## Development
+
+Zero dependencies, standard library only. Run the unit tests (network is
+stubbed, so they are fast and deterministic):
+
+```bash
+python -m unittest discover -s tests -v
+```
+
+`tests/test_modellens.py` covers scoring, verdicts, p95, the history store,
+recommendations, discovery/pricing parsing, and the MCP wire protocol. CI runs
+the same suite on Python 3.9 and 3.12 on every push and PR.
 
 ## Hosted / paid
 
