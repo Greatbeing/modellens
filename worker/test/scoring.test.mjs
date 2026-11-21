@@ -6,7 +6,9 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { median, scoreModel, aggregate, round1 } from '../src/index.js';
 
-const row = (ok, status = 200, lat = null) => ({ model: 'm', endpoint: 'e', ok, status, latency_ms: lat });
+const row = (ok, status = 200, lat = null, probed_at) => ({ model: 'm', endpoint: 'e', ok, status, latency_ms: lat, ...(probed_at ? { probed_at } : {}) });
+const NOW = Date.parse('2026-11-21T12:00:00Z');
+const isoHoursAgo = (h) => new Date(NOW - h * 3600 * 1000).toISOString().replace(/\.\d{3}Z$/, 'Z');
 
 test('median, not mean', () => {
   assert.equal(median([100, 200, 10000]), 200); // mean would be 3433
@@ -82,4 +84,38 @@ test('round1 ties-to-even matches Python round(x,1)', () => {
 test('score at an exact tie rounds like Python (81.25 -> 81.2)', () => {
   const s = scoreModel(Array.from({ length: 10 }, () => row(true, 200, 5000)));
   assert.equal(s.score, 81.2);
+});
+
+// ---- staleness (mirrors modellens.py) ----
+
+test('fresh success stays healthy', () => {
+  const s = scoreModel(Array.from({ length: 10 }, () => row(true, 200, 2000, isoHoursAgo(0.5))), NOW);
+  assert.equal(s.verdict, 'healthy');
+  assert.equal(s.age_hours, 0.5);
+});
+
+test('old success becomes stale, score kept', () => {
+  const s = scoreModel(Array.from({ length: 10 }, () => row(true, 200, 2000, isoHoursAgo(7))), NOW);
+  assert.equal(s.verdict, 'stale');
+  assert.ok(s.score > 0);
+  assert.equal(s.age_hours, 7);
+});
+
+test('stale boundary is 6h', () => {
+  assert.equal(scoreModel(Array.from({ length: 10 }, () => row(true, 200, 2000, isoHoursAgo(5.9))), NOW).verdict, 'healthy');
+  assert.equal(scoreModel(Array.from({ length: 10 }, () => row(true, 200, 2000, isoHoursAgo(6.1))), NOW).verdict, 'stale');
+});
+
+test('dead / quota_blocked / unreliable keep their verdict when old', () => {
+  assert.equal(scoreModel(Array.from({ length: 5 }, () => row(false, 404, null, isoHoursAgo(48))), NOW).verdict, 'dead');
+  assert.equal(scoreModel(Array.from({ length: 5 }, () => row(false, 429, null, isoHoursAgo(48))), NOW).verdict, 'quota_blocked');
+  const rows = [...Array.from({ length: 7 }, () => row(true, 200, 100, isoHoursAgo(48))),
+                ...Array.from({ length: 3 }, () => row(false, 0, null, isoHoursAgo(48)))];
+  assert.equal(scoreModel(rows, NOW).verdict, 'unreliable');
+});
+
+test('missing probed_at is never stale', () => {
+  const s = scoreModel(Array.from({ length: 10 }, () => row(true, 200, 2000)), NOW);
+  assert.equal(s.verdict, 'healthy');
+  assert.equal(s.age_hours, null);
 });

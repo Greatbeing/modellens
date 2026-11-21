@@ -27,6 +27,7 @@ config.json:
 from __future__ import annotations
 
 import argparse
+import calendar
 import json
 import math
 import os
@@ -38,7 +39,7 @@ from statistics import median
 
 PROTOCOL_VERSION = "2024-11-05"
 SERVER_NAME = "modellens"
-SERVER_VERSION = "0.1.4"
+SERVER_VERSION = "0.1.5"
 
 # How hard a probe pushes a model: enough to expose broken routing, cheap enough
 # to run often. A probe is a real request, so it costs a few tokens.
@@ -53,6 +54,9 @@ W_LATENCY = 30.0
 W_CANCEL = 20.0
 LATENCY_REFERENCE_MS = 8000.0  # a median at or above this scores 0 on latency
 FAST_MIN_SUCCESS = 90.0  # 'fast' only routes to models at or above this success rate
+STALE_AFTER_HOURS = 6.0  # evidence older than this is too old to route on:
+# the probe cron runs every 2h, so 6h is three missed cycles. A model that was
+# healthy this morning can be quota-blocked by noon on a free tier.
 
 
 # --------------------------------------------------------------------------
@@ -330,7 +334,34 @@ class Store:
 # Analysis
 # --------------------------------------------------------------------------
 
-def score_model(rows: list[dict]) -> dict:
+def _parse_ts(value) -> float | None:
+    """Parse a probe 'probed_at' ISO-8601 UTC timestamp to epoch seconds.
+
+    Returns None for missing or unparseable values: age unknown means
+    "not proven stale", never "stale by default".
+    """
+    if not isinstance(value, str):
+        return None
+    try:
+        return calendar.timegm(time.strptime(value, "%Y-%m-%dT%H:%M:%SZ"))
+    except (ValueError, TypeError):
+        return None
+
+
+def _format_age(age_hours: float | None) -> str:
+    """Short human age for a table column: '12m' / '3h' / '2d' / '-'."""
+    if age_hours is None:
+        return "-"
+    if age_hours < 1:
+        return f"{max(1, round(age_hours * 60))}m"
+    if age_hours < 48:
+        return f"{age_hours:.0f}h"
+    return f"{age_hours / 24:.0f}d"
+
+
+def score_model(rows: list[dict], now: float | None = None) -> dict:
+    if now is None:
+        now = time.time()
     attempts = len(rows)
     oks = [r for r in rows if r.get("ok")]
     failures = attempts - len(oks)
@@ -340,6 +371,17 @@ def score_model(rows: list[dict]) -> dict:
     success_rate = (len(oks) / attempts * 100.0) if attempts else 0.0
     cancel_rate = (cancelled / attempts * 100.0) if attempts else 0.0
     med = median(latencies) if latencies else None
+
+    # Freshness of the evidence: the newest probe in these rows.
+    last_ts = None
+    for r in rows:
+        ts = _parse_ts(r.get("probed_at"))
+        if ts is not None and (last_ts is None or ts > last_ts):
+            last_ts = ts
+    age_hours = (round(max(0.0, now - last_ts) / 3600.0, 1)
+                 if last_ts is not None else None)
+    last_probed_at = (time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(last_ts))
+                      if last_ts is not None else None)
 
     if attempts == 0:
         verdict = "untested"
@@ -354,6 +396,13 @@ def score_model(rows: list[dict]) -> dict:
     else:
         verdict = "mixed"
 
+    if (attempts and success_rate > 0 and verdict in ("healthy", "mixed")
+            and age_hours is not None and age_hours > STALE_AFTER_HOURS):
+        # Old evidence is not bad evidence — it is no evidence about *now*.
+        # Failure verdicts (dead/quota_blocked/unreliable) are kept: they say
+        # what the last probe found, and the age column says how long ago.
+        verdict = "stale"
+
     if attempts == 0 or success_rate == 0:
         # No evidence, or only failures: nothing to recommend. Keeping this at 0
         # stops a dead or quota-blocked model outranking a merely mediocre one.
@@ -363,6 +412,7 @@ def score_model(rows: list[dict]) -> dict:
             "success_rate": 0.0, "cancel_rate": round(cancel_rate, 1),
             "median_latency_ms": None, "p95_latency_ms": None,
             "score": 0.0, "verdict": verdict,
+            "last_probed_at": last_probed_at, "age_hours": age_hours,
         }
 
     latency_score = max(0.0, min(1.0, 1.0 - (med / LATENCY_REFERENCE_MS))) * 100.0
@@ -383,10 +433,14 @@ def score_model(rows: list[dict]) -> dict:
             if len(latencies) >= 20 else None,
         "score": round(score, 1),
         "verdict": verdict,
+        "last_probed_at": last_probed_at,
+        "age_hours": age_hours,
     }
 
 
-def build_ranking(store: Store, endpoints: list[Endpoint]) -> list[dict]:
+def build_ranking(store: Store, endpoints: list[Endpoint], now: float | None = None) -> list[dict]:
+    if now is None:
+        now = time.time()
     models: dict[str, dict] = {}
     for ep in endpoints:
         if not ep.enabled:
@@ -398,7 +452,7 @@ def build_ranking(store: Store, endpoints: list[Endpoint]) -> list[dict]:
                            "pricing": info["pricing"]}
     out = []
     for key, info in models.items():
-        stats = score_model(store.for_model(info["endpoint"], info["model"]))
+        stats = score_model(store.for_model(info["endpoint"], info["model"]), now=now)
         out.append({**info, **stats})
     out.sort(key=lambda r: (-r["score"], r["id"]))
     return out
@@ -420,10 +474,15 @@ def _zero_priced(row: dict) -> bool:
 def recommend(ranking: list[dict], profile: str) -> dict:
     profile = (profile or "capable").lower()
     usable = [r for r in ranking
-              if r["score"] > 0 and r["verdict"] not in ("dead", "quota_blocked")]
+              if r["score"] > 0 and r["verdict"] not in ("dead", "quota_blocked", "stale")]
     note = None
     criteria = PROFILE_HINTS.get(profile, PROFILE_HINTS["capable"])
     if not usable:
+        if any(r.get("verdict") == "stale" for r in ranking):
+            return {"profile": profile, "criteria": criteria, "picks": [],
+                    "note": f"all models with a passing score are stale "
+                            f"(not probed in the last {STALE_AFTER_HOURS:.0f}h) — "
+                            f"probe again for a fresh recommendation"}
         return {"profile": profile, "criteria": criteria, "picks": [],
                 "note": "no model has a passing score yet"}
 
@@ -456,7 +515,7 @@ def recommend(ranking: list[dict], profile: str) -> dict:
             {"rank": i + 1, "id": r["id"], "score": r["score"],
              "median_latency_ms": r["median_latency_ms"],
              "success_rate": r["success_rate"], "verdict": r["verdict"],
-             "attempts": r["attempts"]}
+             "attempts": r["attempts"], "age_hours": r.get("age_hours")}
             for i, r in enumerate(usable[:5])
         ],
     }
@@ -576,11 +635,12 @@ def tool_ranking(ctx: Context, args: dict) -> str:
     untested = [r for r in ranking if r["attempts"] == 0]
     tested.sort(key=lambda r: (-r["score"], r["id"]))
 
-    lines = [f"{'model':58s} {'score':>6} {'succ':>6} {'cancel':>7} {'median':>9} {'n':>4}  verdict"]
+    lines = [f"{'model':58s} {'score':>6} {'succ':>6} {'cancel':>7} {'median':>9} {'n':>4}  {'age':>5}  verdict"]
     for r in tested[:limit]:
         med = f"{r['median_latency_ms']:.0f}ms" if r["median_latency_ms"] is not None else "-"
         lines.append(f"{r['id']:58s} {r['score']:6.1f} {r['success_rate']:5.1f}% "
-                     f"{r['cancel_rate']:6.1f}% {med:>9} {r['attempts']:4d}  {r['verdict']}")
+                     f"{r['cancel_rate']:6.1f}% {med:>9} {r['attempts']:4d}  "
+                     f"{_format_age(r.get('age_hours')):>5}  {r['verdict']}")
     if show_all:
         lines.append("")
         lines.append(f"## Untested ({len(untested)})")
@@ -589,6 +649,10 @@ def tool_ranking(ctx: Context, args: dict) -> str:
     else:
         lines.append("")
         lines.append(f"({len(untested)} more untested — pass all=true to list them)")
+    stale = [r for r in ranking if r["verdict"] == "stale"]
+    if stale:
+        lines.append(f"({len(stale)} stale — not probed in the last "
+                     f"{STALE_AFTER_HOURS:.0f}h, never recommended)")
     return "\n".join(lines)
 
 
@@ -600,8 +664,10 @@ def tool_recommend(ctx: Context, args: dict) -> str:
     lines = [f"Profile: {res['profile']}  ({res['criteria']})", ""]
     for p in res["picks"]:
         med = f"{p['median_latency_ms']:.0f}ms" if p["median_latency_ms"] is not None else "-"
+        age = _format_age(p.get("age_hours"))
         lines.append(f"{p['rank']}. {p['id']} — score {p['score']}, "
-                     f"success {p['success_rate']}%, median {med}, {p['verdict']} (n={p['attempts']})")
+                     f"success {p['success_rate']}%, median {med}, {p['verdict']} "
+                     f"(n={p['attempts']}, probed {age} ago)")
     if res.get("note"):
         lines += ["", res["note"]]
     return "\n".join(lines)
@@ -622,18 +688,19 @@ def tool_report(ctx: Context, args: dict) -> str:
     lines.append(f"- probes recorded: {len(ctx.store.rows)}")
     lines.append("")
     lines.append("## Verdicts")
-    for k in ("healthy", "mixed", "unreliable", "quota_blocked", "dead", "untested"):
+    for k in ("healthy", "mixed", "unreliable", "quota_blocked", "dead", "stale", "untested"):
         if verdicts.get(k):
             lines.append(f"- {k}: {verdicts[k]}")
     lines.append("")
     lines.append("## Top 15 by score")
     lines.append("")
-    lines.append("| model | score | success | cancel | median | n | verdict |")
-    lines.append("| --- | --- | --- | --- | --- | --- | --- |")
+    lines.append("| model | score | success | cancel | median | n | verdict | age |")
+    lines.append("| --- | --- | --- | --- | --- | --- | --- | --- |")
     for r in ranking[:15]:
         med = f"{r['median_latency_ms']:.0f}ms" if r["median_latency_ms"] is not None else "-"
         lines.append(f"| {r['id']} | {r['score']} | {r['success_rate']}% "
-                     f"| {r['cancel_rate']}% | {med} | {r['attempts']} | {r['verdict']} |")
+                     f"| {r['cancel_rate']}% | {med} | {r['attempts']} | {r['verdict']} | "
+                     f"{_format_age(r.get('age_hours'))} |")
     return "\n".join(lines)
 
 

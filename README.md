@@ -178,7 +178,9 @@ Every probe is a real request, so the numbers are evidence, not estimates.
 | Cancellation rate | 20% | Timeouts and client cancellations |
 
 Verdicts: `healthy` (≥95% success, <3 s median) · `mixed` · `unreliable`
-(≥30% cancelled) · `quota_blocked` (all 429) · `dead` (all 404) · `untested`.
+(≥30% cancelled) · `quota_blocked` (all 429) · `dead` (all 404) · `stale`
+(not probed in the last 6 h — the evidence is too old to route on, so the
+model is never recommended) · `untested`.
 
 History is kept per model (newest 200 probes) in `history.json`, so rankings
 improve as you use it.
@@ -229,6 +231,12 @@ MIT. Use it, ship it, charge for your own hosted version.
   sensible and don't probe a hundred models every minute.
 - **A single probe is weak evidence.** The score is meaningful after several
   probes; the report says `n=1` so you can see the sample size.
+- **A recommendation is only as fresh as its last probe.** A model not probed
+  in the last 6 hours is marked `stale` and never recommended — on free tiers
+  a model that was healthy this morning can be quota-blocked by noon. The
+  ranking table shows how long ago each model was last probed; failure
+  verdicts (`dead` / `quota_blocked` / `unreliable`) are kept even when old,
+  because they say what the last probe found.
 - **Latency depends on you.** Your network, not just the provider, is in the
   measurement. Run it from where your agents run.
 - **`fast` keeps a ≥90% success bar.** If nothing qualifies it says so instead
@@ -257,7 +265,8 @@ the same suite on Python 3.9 and 3.12 on every push and PR.
 The hosted Cloudflare Worker (`worker/`) serves the read-only tools from KV; its
 scoring is kept in lock-step with `modellens.py` (median latency, cancellation =
 status 0/499, score 0 on 0% success, same verdicts). `worker/test/scoring.test.mjs`
-pins this — run `node --test` in `worker/`. Deploying the worker requires
+pins this — run `node --test test/scoring.test.mjs` in `worker/` (plain
+`node --test test/` does not resolve the directory on Node 24). Deploying the worker requires
 `wrangler secret put INGEST_SECRET`; the secret is not committed (and any value
 previously committed must be rotated).
 

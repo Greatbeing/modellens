@@ -158,8 +158,23 @@ async function verifyAndSettle(env, xPayment, req) {
 
 // Scoring mirrors modellens.py score_model exactly: median latency (not mean),
 // cancellation = status 0/499 (not a 'cancelled' string), score 0 on 0% success,
-// and dead/quota_blocked verdicts. The hosted worker must not drift from the
-// CLI/MCP core — same data must yield the same numbers.
+// dead/quota_blocked verdicts, and the stale verdict (evidence older than
+// STALE_AFTER_HOURS is too old to route on). The hosted worker must not drift
+// from the CLI/MCP core — same data must yield the same numbers.
+const STALE_AFTER_HOURS = 6;
+
+function parseTs(s) {
+  if (typeof s !== 'string') return null;
+  const t = Date.parse(s);
+  return Number.isNaN(t) ? null : t;
+}
+
+function formatAge(ageHours) {
+  if (ageHours == null) return '-';
+  if (ageHours < 1) return Math.max(1, Math.round(ageHours * 60)) + 'm';
+  if (ageHours < 48) return Math.round(ageHours) + 'h';
+  return Math.round(ageHours / 24) + 'd';
+}
 function median(arr) {
   if (!arr.length) return null;
   const s = [...arr].sort((a, b) => a - b);
@@ -179,7 +194,8 @@ function round1(x) {
   return Number(x.toFixed(1));
 }
 
-function scoreModel(rows) {
+function scoreModel(rows, nowMs) {
+  const now = nowMs == null ? Date.now() : nowMs;
   const attempts = rows.length;
   const oks = rows.filter((r) => r.ok);
   const cancelled = rows.filter((r) => !r.ok && (r.status === 0 || r.status === 499)).length;
@@ -187,6 +203,14 @@ function scoreModel(rows) {
   const success_rate = attempts ? (oks.length / attempts) * 100 : 0;
   const cancel_rate = attempts ? (cancelled / attempts) * 100 : 0;
   const med = median(latencies);
+
+  let lastTs = null;
+  for (const r of rows) {
+    const t = parseTs(r.probed_at);
+    if (t != null && (lastTs == null || t > lastTs)) lastTs = t;
+  }
+  const age_hours = lastTs == null ? null : Math.max(0, Math.round(((now - lastTs) / 3600000) * 10) / 10);
+  const last_probed_at = lastTs == null ? null : new Date(lastTs).toISOString().replace(/\.\d{3}Z$/, 'Z');
 
   let verdict;
   if (attempts === 0) verdict = 'untested';
@@ -196,25 +220,30 @@ function scoreModel(rows) {
   else if (success_rate >= 95 && (med == null ? 9e9 : med) < 3000) verdict = 'healthy';
   else verdict = 'mixed';
 
+  if (attempts && success_rate > 0 && (verdict === 'healthy' || verdict === 'mixed')
+      && age_hours != null && age_hours > STALE_AFTER_HOURS) verdict = 'stale';
+
   if (attempts === 0 || success_rate === 0) {
     return { attempts, ok: 0, failed: attempts, cancelled, success_rate: 0,
-             cancel_rate: round1(cancel_rate), median_latency_ms: null, score: 0, verdict };
+             cancel_rate: round1(cancel_rate), median_latency_ms: null, score: 0, verdict,
+             last_probed_at, age_hours };
   }
   const latency_score = Math.max(0, Math.min(1, 1 - med / 8000)) * 100;
   const score = (success_rate * 50 + latency_score * 30 + Math.max(0, 100 - cancel_rate * 2) * 20) / 100;
   return { attempts, ok: oks.length, failed: attempts - oks.length, cancelled,
            success_rate: round1(success_rate), cancel_rate: round1(cancel_rate),
-           median_latency_ms: med == null ? null : round1(med), score: round1(score), verdict };
+           median_latency_ms: med == null ? null : round1(med), score: round1(score), verdict,
+           last_probed_at, age_hours };
 }
 
-function aggregate(rows) {
+function aggregate(rows, nowMs) {
   const byModel = {};
   for (const r of rows || []) {
     if (!r.model) continue;
     (byModel[r.model] = byModel[r.model] || []).push(r);
   }
   const out = [];
-  for (const [m, rs] of Object.entries(byModel)) out.push({ model: m, ...scoreModel(rs) });
+  for (const [m, rs] of Object.entries(byModel)) out.push({ model: m, ...scoreModel(rs, nowMs) });
   out.sort((a, b) => b.score - a.score
     || (a.median_latency_ms ?? 1e12) - (b.median_latency_ms ?? 1e12)
     || a.model.localeCompare(b.model));
@@ -238,10 +267,12 @@ async function toolRanking(env, args) {
   if (!raw) return 'no probe history yet';
   const rows = aggregate(JSON.parse(raw).rows);
   const limit = parseInt(args.limit || '30', 10);
-  const lines = ['| model | score | success | cancel | median | n | verdict |', '| --- | --- | --- | --- | --- | --- | --- |'];
+  const lines = ['| model | score | success | cancel | median | n | verdict | age |', '| --- | --- | --- | --- | --- | --- | --- | --- |'];
   for (const r of rows.slice(0, limit)) {
-    lines.push(`| ${r.model} | ${r.score} | ${r.success_rate}% | ${r.cancel_rate}% | ${r.median_latency_ms != null ? Math.round(r.median_latency_ms) + 'ms' : '-'} | ${r.attempts} | ${r.verdict} |`);
+    lines.push(`| ${r.model} | ${r.score} | ${r.success_rate}% | ${r.cancel_rate}% | ${r.median_latency_ms != null ? Math.round(r.median_latency_ms) + 'ms' : '-'} | ${r.attempts} | ${r.verdict} | ${formatAge(r.age_hours)} |`);
   }
+  const stale = rows.filter((r) => r.verdict === 'stale').length;
+  if (stale) lines.push(`\n(${stale} stale — not probed in the last ${STALE_AFTER_HOURS}h, never recommended)`);
   return lines.join('\n');
 }
 
@@ -249,8 +280,11 @@ async function toolRecommend(env, args) {
   const raw = await env.DATA.get('history');
   if (!raw) return 'no probe history yet';
   const rows = aggregate(JSON.parse(raw).rows);
-  let usable = rows.filter((r) => r.score > 0 && r.verdict !== 'dead' && r.verdict !== 'quota_blocked');
-  if (!usable.length) return 'no model has a passing score yet';
+  let usable = rows.filter((r) => r.score > 0 && r.verdict !== 'dead' && r.verdict !== 'quota_blocked' && r.verdict !== 'stale');
+  if (!usable.length) {
+    if (rows.some((r) => r.verdict === 'stale')) return `all models with a passing score are stale (not probed in the last ${STALE_AFTER_HOURS}h) — probe again for a fresh recommendation`;
+    return 'no model has a passing score yet';
+  }
   const profile = (args.profile || 'capable').trim().toLowerCase();
   let note = '';
   if (profile === 'fast') {
@@ -266,7 +300,7 @@ async function toolRecommend(env, args) {
   }
   const pick = usable[0];
   const runner = usable[1];
-  return `**Recommended (${profile}): \`${pick.model}\`** — score ${pick.score}, success ${pick.success_rate}%${pick.median_latency_ms != null ? ', median ' + Math.round(pick.median_latency_ms) + 'ms' : ''}, verdict ${pick.verdict} (n=${pick.attempts}).\n\nRunner-up: ${runner ? '`' + runner.model + '` (score ' + runner.score + ')' : 'n/a'}.${note}`;
+  return `**Recommended (${profile}): \`${pick.model}\`** — score ${pick.score}, success ${pick.success_rate}%${pick.median_latency_ms != null ? ', median ' + Math.round(pick.median_latency_ms) + 'ms' : ''}, verdict ${pick.verdict} (n=${pick.attempts}, probed ${formatAge(pick.age_hours)} ago).\n\nRunner-up: ${runner ? '`' + runner.model + '` (score ' + runner.score + ')' : 'n/a'}.${note}`;
 }
 
 async function toolReport(env) {
@@ -284,13 +318,13 @@ async function toolReport(env) {
     `- probes recorded: ${(h.rows || []).length}`,
     '',
     '## Verdicts',
-    ...['healthy', 'mixed', 'unreliable', 'quota_blocked', 'dead', 'untested'].filter((k) => counts[k]).map((k) => `- ${k}: ${counts[k]}`),
+    ...['healthy', 'mixed', 'unreliable', 'quota_blocked', 'dead', 'stale', 'untested'].filter((k) => counts[k]).map((k) => `- ${k}: ${counts[k]}`),
     '',
     '## Top 15 by score',
     '',
-    '| model | score | success | cancel | median | n | verdict |',
-    '| --- | --- | --- | --- | --- | --- | --- |',
-    ...rows.slice(0, 15).map((r) => `| ${r.model} | ${r.score} | ${r.success_rate}% | ${r.cancel_rate}% | ${r.median_latency_ms != null ? Math.round(r.median_latency_ms) + 'ms' : '-'} | ${r.attempts} | ${r.verdict} |`),
+    '| model | score | success | cancel | median | n | verdict | age |',
+    '| --- | --- | --- | --- | --- | --- | --- | --- |',
+    ...rows.slice(0, 15).map((r) => `| ${r.model} | ${r.score} | ${r.success_rate}% | ${r.cancel_rate}% | ${r.median_latency_ms != null ? Math.round(r.median_latency_ms) + 'ms' : '-'} | ${r.attempts} | ${r.verdict} | ${formatAge(r.age_hours)} |`),
     '',
     `_Snapshot pushed ${h.updated_at || 'unknown'}_`,
   ];
@@ -333,7 +367,7 @@ async function handleMcp(env, req, msg) {
     return jsonrpc(id, {
       protocolVersion: '2025-06-18',
       capabilities: { tools: {} },
-      serverInfo: { name: 'modellens-x402', version: '0.1.4' },
+      serverInfo: { name: 'modellens-x402', version: '0.1.5' },
     });
   }
   if (method && method.startsWith('notifications/')) return null;
@@ -400,7 +434,7 @@ export default {
     }
 
     if (url.pathname === '/health' && req.method === 'GET') {
-      return Response.json({ ok: true, server: 'modellens-x402-worker', version: '0.1.4' });
+      return Response.json({ ok: true, server: 'modellens-x402-worker', version: '0.1.5' });
     }
 
     // ingest: being pushes history + models snapshots

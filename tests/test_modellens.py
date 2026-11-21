@@ -12,6 +12,7 @@ import math
 import os
 import sys
 import tempfile
+import time
 import unittest
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -20,9 +21,19 @@ sys.path.insert(0, REPO_ROOT)
 import modellens as M  # noqa: E402
 
 
+def _now_iso():
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+
 def row(ok, status=200, lat=None, endpoint="e", model="m", probed_at=None):
+    # Default probed_at is *now*: a row with no explicit timestamp is fresh
+    # evidence. Tests about staleness pass explicit old timestamps + now.
     return {"endpoint": endpoint, "model": model, "ok": ok, "status": status,
-            "latency_ms": lat, "probed_at": probed_at or "2026-01-01T00:00:00Z"}
+            "latency_ms": lat, "probed_at": probed_at or _now_iso()}
+
+
+def _iso(epoch):
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(epoch))
 
 
 class ScoreModelTest(unittest.TestCase):
@@ -76,6 +87,63 @@ class ScoreModelTest(unittest.TestCase):
     def test_p95_requires_20_samples(self):
         s = M.score_model([row(True, 200, 100.0) for _ in range(19)])
         self.assertIsNone(s["p95_latency_ms"])
+
+
+class StaleTest(unittest.TestCase):
+    NOW = 1790000000.0  # fixed "now" so age math is deterministic
+
+    def _rows(self, age_hours, ok=True, status=200, lat=200.0, n=10):
+        ts = _iso(self.NOW - age_hours * 3600)
+        return [row(ok, status, lat, probed_at=ts) for _ in range(n)]
+
+    def test_fresh_success_stays_healthy(self):
+        s = M.score_model(self._rows(0.5), now=self.NOW)
+        self.assertEqual(s["verdict"], "healthy")
+        self.assertAlmostEqual(s["age_hours"], 0.5, places=1)
+
+    def test_old_success_becomes_stale_score_kept(self):
+        # Staleness is a verdict, not a score penalty: the evidence is old,
+        # not bad. The score stays so ranking still shows how good it *was*.
+        s = M.score_model(self._rows(7), now=self.NOW)
+        self.assertEqual(s["verdict"], "stale")
+        self.assertGreater(s["score"], 0)
+        self.assertAlmostEqual(s["age_hours"], 7.0, places=1)
+        self.assertEqual(s["last_probed_at"], _iso(self.NOW - 7 * 3600))
+
+    def test_stale_boundary(self):
+        self.assertEqual(M.score_model(self._rows(5.9), now=self.NOW)["verdict"],
+                         "healthy")
+        self.assertEqual(M.score_model(self._rows(6.1), now=self.NOW)["verdict"],
+                         "stale")
+
+    def test_dead_stays_dead_when_old(self):
+        s = M.score_model(self._rows(48, ok=False, status=404), now=self.NOW)
+        self.assertEqual(s["verdict"], "dead")
+
+    def test_quota_blocked_stays_quota_blocked_when_old(self):
+        s = M.score_model(self._rows(48, ok=False, status=429), now=self.NOW)
+        self.assertEqual(s["verdict"], "quota_blocked")
+
+    def test_unreliable_stays_unreliable_when_old(self):
+        rows = (self._rows(48, n=7)
+                + [row(False, 0, probed_at=_iso(self.NOW - 48 * 3600))
+                   for _ in range(3)])
+        self.assertEqual(M.score_model(rows, now=self.NOW)["verdict"], "unreliable")
+
+    def test_missing_timestamp_is_never_stale(self):
+        # Age unknown means "not proven stale": old history files may lack
+        # probed_at, and they must not flip to stale on a guess.
+        rows = [{k: v for k, v in r.items() if k != "probed_at"}
+                for r in self._rows(0)]
+        s = M.score_model(rows, now=self.NOW)
+        self.assertEqual(s["verdict"], "healthy")
+        self.assertIsNone(s["age_hours"])
+
+    def test_format_age(self):
+        self.assertEqual(M._format_age(None), "-")
+        self.assertEqual(M._format_age(0.25), "15m")
+        self.assertEqual(M._format_age(3.0), "3h")
+        self.assertEqual(M._format_age(72.0), "3d")
 
 
 class StoreTest(unittest.TestCase):
@@ -155,6 +223,18 @@ class RecommendTest(unittest.TestCase):
              self._r("ok", 50.0, 90.0, 400.0)]
         rec = M.recommend(r, "capable")
         self.assertEqual([p["id"] for p in rec["picks"]], ["e/ok"])
+
+    def test_excludes_stale_even_with_top_score(self):
+        r = [self._r("stale", 99.0, 100.0, 200.0, "stale"),
+             self._r("ok", 50.0, 90.0, 400.0)]
+        rec = M.recommend(r, "capable")
+        self.assertEqual([p["id"] for p in rec["picks"]], ["e/ok"])
+
+    def test_all_stale_note_says_probe_again(self):
+        rec = M.recommend([self._r("old", 90.0, 100.0, 200.0, "stale")], "capable")
+        self.assertEqual(rec["picks"], [])
+        self.assertIn("stale", rec["note"])
+        self.assertIn("probe again", rec["note"])
 
 
 class DiscoveryTest(unittest.TestCase):
