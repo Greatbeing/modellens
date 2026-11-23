@@ -1,0 +1,44 @@
+[Unit]
+Description=ModelLens proxy (evidence-based OpenAI-compatible router)
+Documentation=https://github.com/Greatbeing/modellens#proxy-route-on-evidence
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=modellens
+Group=modellens
+# Optional: MODELLENS_CONFIG / MODELLENS_DATA overrides live here.
+EnvironmentFile=-/etc/modellens/proxy.env
+ExecStart=/usr/local/bin/modellens-proxy \
+    --config /etc/modellens/config.json \
+    --data /var/lib/modellens/history.json \
+    --listen 127.0.0.1:8766
+Restart=on-failure
+RestartSec=2
+
+# Creates /var/lib/modellens owned by User= and keeps it writable under
+# ProtectSystem=strict; the history file is the only state the proxy needs.
+StateDirectory=modellens
+
+# Hardening. The proxy only needs TCP to the gateways and its listening socket.
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+
+[Install]
+WantedBy=multi-user.target

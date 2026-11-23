@@ -321,6 +321,19 @@ Clients can tighten (never loosen) the ceiling per request with `X-Modellens-Max
 `/modellens/explain?max_cost=...` shows the effect without calling upstream. No ceiling configured
 and no header = no budget gate.
 
+### Deploy it
+
+- **Docker**: `docker compose -f deploy/docker-compose.yml up -d --build` — non-root
+  image, read-only root, `/data` volume for history, healthcheck on
+  `/modellens/health`. CI builds and runs the image on every push, so the
+  Dockerfile cannot rot silently.
+- **systemd**: `deploy/modellens-proxy.service` — hardened unit (`ProtectSystem=strict`,
+  `StateDirectory=modellens`, `NoNewPrivileges`), listening on `127.0.0.1:8766`.
+- **Seed first**: a fresh proxy has no history and answers `503 no_candidate`
+  until something is probed — run `--once probe --limit 20 --check-tools` once.
+
+Full steps, including the cron line that keeps evidence fresh: [`deploy/README.md`](deploy/README.md).
+
 ## CLI
 
 The server doubles as a command-line tool:

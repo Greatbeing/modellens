@@ -37,3 +37,31 @@ jobs:
       - name: Worker scoring tests (node:test, zero deps)
         run: node --test
         working-directory: worker
+
+  docker:
+    # Builds and runs deploy/proxy.Dockerfile, because a Dockerfile that is
+    # never executed is a guess: this catches a broken COPY, a missing console
+    # script and a healthcheck that never turns healthy.
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Build the proxy image
+        run: docker build -f deploy/proxy.Dockerfile -t modellens-proxy:ci .
+      - name: Run it with no endpoints and wait for health
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/mc
+          printf '%s\n' '{"endpoints":[],"proxy":{"listen":"0.0.0.0:8766"}}' > /tmp/mc/config.json
+          docker run -d --name proxy -p 8766:8766 -v /tmp/mc:/config:ro modellens-proxy:ci
+          for i in $(seq 1 30); do
+            if curl -fsS http://127.0.0.1:8766/modellens/health; then break; fi
+            sleep 1
+          done
+          curl -fsS http://127.0.0.1:8766/modellens/health | grep -q '"ok": true'
+          curl -fsS http://127.0.0.1:8766/v1/models | grep -q 'auto:fast'
+      - name: Show container logs on failure
+        if: failure()
+        run: docker logs proxy || true
+      - name: Verify the image runs as non-root
+        run: |
+          test "$(docker run --rm --entrypoint id modellens-proxy:ci -u)" != "0"

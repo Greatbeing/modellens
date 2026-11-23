@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+### Added
+- `deploy/`: a proxy Dockerfile (non-root, read-only root, `/data` volume,
+  healthcheck), a Compose file, a hardened systemd unit and install notes. CI
+  builds and smoke-runs the image on every push (job `docker`), and the
+  Dockerfile's packaging steps were verified locally (wheel → console scripts →
+  `modellens-proxy --once`).
+
 ### Changed
 - **modellens-proxy**: `auto:balanced` now penalises latency tails. Once a
   model has ≥20 latency samples, its effective latency is

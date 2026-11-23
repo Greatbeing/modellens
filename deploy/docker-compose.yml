@@ -1,0 +1,45 @@
+# Run the ModelLens proxy in Docker:
+#
+#   cp config.example.json deploy/config.json   # then edit endpoints
+#   docker compose -f deploy/docker-compose.yml up -d --build
+#   curl -s localhost:8766/modellens/health
+#
+# The history volume is the router's memory: keeping it means a rebuild does not
+# throw away the evidence it learned from.
+
+services:
+  proxy:
+    build:
+      context: ..
+      dockerfile: deploy/proxy.Dockerfile
+    image: modellens-proxy:local
+    restart: unless-stopped
+    ports:
+      # Loopback only by default: the proxy speaks to client SDKs without auth,
+      # so putting it on 0.0.0.0 is a decision, not a default.
+      - "127.0.0.1:8766:8766"
+    volumes:
+      - ./config.json:/config/config.json:ro
+      - modellens-data:/data
+    environment:
+      MODELLENS_CONFIG: /config/config.json
+      MODELLENS_DATA: /data/history.json
+    # Nothing needs to be written outside /data.
+    read_only: true
+    tmpfs:
+      - /tmp
+    security_opt:
+      - no-new-privileges:true
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import sys,urllib.request; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8766/modellens/health', timeout=3).status == 200 else 1)"
+      interval: 30s
+      timeout: 5s
+      start_period: 20s
+      retries: 3
+
+volumes:
+  modellens-data:

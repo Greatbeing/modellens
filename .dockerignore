@@ -1,0 +1,16 @@
+dist/
+build/
+*.egg-info/
+.git/
+.github/
+worker/
+tests/
+tools/
+.deploy-tmp/
+__pycache__/
+*.pyc
+.msg
+.wallet.key
+config.json
+history.json
+settlements_pending.jsonl

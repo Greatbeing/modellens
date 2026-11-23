@@ -1,3 +1,5 @@
+# MCP server image, used by Smithery (see smithery.yaml).
+# For the routing proxy use deploy/proxy.Dockerfile instead.
 FROM python:3.12-alpine
 WORKDIR /app
 COPY modellens.py .
