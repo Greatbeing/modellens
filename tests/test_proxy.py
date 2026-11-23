@@ -835,8 +835,7 @@ class BudgetE2ETest(ProxyHarness):
             headers={"X-Modellens-Max-Cost": "0.001"})
         self.assertEqual(status, 503)
         self.assertIn("over_budget", data.decode())
-        self.assertEqual(Upstream.calls.get("m", 0) if isinstance(
-            getattr(Upstream, "calls", None), dict) else 0, 0)
+        self.assertEqual(Upstream.called_models(), [])    # never forwarded
 
     def test_max_tokens_brings_it_under_budget(self):
         status, _, _ = self.request(
