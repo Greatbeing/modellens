@@ -840,6 +840,11 @@ class ConnectionPoolTest(ProxyHarness):
         with Upstream.lock:            # discovery at startup also opens one
             Upstream.connections = 0
         self.chat(model="auto:capable")
+        # The proxy returns the connection to the pool in the relay's finally,
+        # which can happen a hair after the client already has its response.
+        self.assertTrue(self.wait_for(
+            lambda: sum(len(b) for b in self.app.pool._idle.values()) >= 1),
+            "connection was never returned to the pool")
         self.chat(model="auto:capable", messages=[{"role": "user", "content": "x"}])
         self.assertEqual(Upstream.connections, 1)      # one TCP connection
         self.assertGreaterEqual(self.app.pool.hits, 1)
