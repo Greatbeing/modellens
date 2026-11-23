@@ -45,7 +45,7 @@ from statistics import median
 
 PROTOCOL_VERSION = "2024-11-05"
 SERVER_NAME = "modellens"
-SERVER_VERSION = "0.1.6"
+SERVER_VERSION = "0.2.0"
 
 # How hard a probe pushes a model: enough to expose broken routing, cheap enough
 # to run often. A probe is a real request, so it costs a few tokens.
@@ -158,6 +158,11 @@ class Endpoint:
         self.api_key = cfg.get("api_key") or cfg.get("apiKey") or ""
         self.enabled = cfg.get("enabled", True)
         self.models_filter = cfg.get("models") or []
+        # Manual truth for what probes cannot measure (json mode, vision, context
+        # window). The proxy gates on capabilities, and guessing would either
+        # block a working model or route a request that must fail.
+        caps = cfg.get("capabilities")
+        self.capabilities = caps if isinstance(caps, dict) else {}
 
     @property
     def chat_url(self) -> str:
@@ -193,9 +198,47 @@ def _parse_pricing(item: dict) -> dict:
     return {"input": num(raw.get("input")), "output": num(raw.get("output"))}
 
 
-def discover_models_detailed(ep: Endpoint) -> list[dict]:
-    """Advertised models with optional pricing metadata: [{id, pricing}]."""
-    status, body, _ = _get(ep.models_url, timeout=20, headers=ep.headers())
+def _parse_cap_meta(item: dict) -> dict:
+    """Best-effort context window / vision flags from a /models entry.
+
+    Providers disagree about both the field names and whether they publish them
+    at all, so every value is Optional: unknown must stay unknown rather than
+    becoming a false "no" that gates a capable model out of routing.
+    """
+    ctx = None
+    for key in ("context_length", "context_window", "max_context_length",
+                "max_model_len", "max_input_tokens"):
+        v = item.get(key)
+        if isinstance(v, (int, float)) and v > 0:
+            ctx = int(v)
+            break
+    if ctx is None:
+        top = item.get("top_provider")
+        if isinstance(top, dict) and isinstance(top.get("context_length"), (int, float)):
+            ctx = int(top["context_length"]) or None
+    vision = None
+    arch = item.get("architecture")
+    if isinstance(arch, dict):
+        mods = arch.get("input_modalities")
+        if isinstance(mods, list):
+            vision = any(str(m).lower() in ("image", "vision") for m in mods)
+    if vision is None:
+        for key in ("supports_vision", "vision"):
+            if isinstance(item.get(key), bool):
+                vision = item[key]
+                break
+    return {"context_length": ctx, "vision": vision}
+
+
+def discover_models_detailed(ep: Endpoint, timeout: float = 20) -> list[dict]:
+    """Advertised models with best-effort metadata.
+
+    [{id, pricing, context_length, vision}] — the extra keys are Optional and
+    do not change the shape existing callers rely on. The proxy passes a short
+    timeout: it rebuilds its routing table in the background and must not hang
+    a request behind a slow /models.
+    """
+    status, body, _ = _get(ep.models_url, timeout=timeout, headers=ep.headers())
     if status != 200 or not isinstance(body, dict):
         return []
     data = body.get("data")
@@ -207,8 +250,11 @@ def discover_models_detailed(ep: Endpoint) -> list[dict]:
         if isinstance(item, dict) and item.get("id"):
             mid = str(item["id"])
             pricing = _parse_pricing(item)
+            meta = _parse_cap_meta(item)
         elif isinstance(item, str):
-            mid, pricing = item, {"input": None, "output": None}
+            mid = item
+            pricing = {"input": None, "output": None}
+            meta = {"context_length": None, "vision": None}
         else:
             continue
         if mid in seen:
@@ -216,7 +262,7 @@ def discover_models_detailed(ep: Endpoint) -> list[dict]:
         if ep.models_filter and not any(f in mid for f in ep.models_filter):
             continue
         seen.add(mid)
-        found.append({"id": mid, "pricing": pricing})
+        found.append({"id": mid, "pricing": pricing, **meta})
     found.sort(key=lambda d: d["id"])
     return found
 
@@ -900,14 +946,47 @@ def _zero_priced(row: dict) -> bool:
     return p.get("input") == 0 and p.get("output") == 0
 
 
+def usable_for_routing(ranking: list[dict]) -> list[dict]:
+    """Rows that may be routed to at all: some success, no failure verdict."""
+    return [r for r in ranking
+            if r.get("score", 0) > 0
+            and r.get("verdict") not in ("dead", "quota_blocked", "auth_error",
+                                         "failing", "stale", "untested")]
+
+
+def order_for_profile(rows: list[dict], profile: str) -> tuple[list[dict], str | None]:
+    """Order routing candidates for a profile; second value is an honest note.
+
+    Shared by recommend() (what to suggest) and the proxy (what to route to), so
+    the two can never disagree about which model is "fastest" or "cheapest".
+    Returns ([], note) when nothing meets the profile's bar.
+    """
+    profile = (profile or "capable").lower()
+    if profile == "fast":
+        ok = [r for r in rows if r.get("success_rate", 0) >= FAST_MIN_SUCCESS]
+        if not ok:
+            return [], f"no model meets the {FAST_MIN_SUCCESS:.0f}% success bar for 'fast'"
+        return sorted(ok, key=lambda r: _latency_key(r)), None
+    if profile == "cheap":
+        free = [r for r in rows if _zero_priced(r)]
+        if free:
+            return (sorted(free, key=lambda r: (-r.get("success_rate", 0), _latency_key(r))),
+                    "zero-priced models (endpoint advertises $0 input/output)")
+        return (sorted(rows, key=lambda r: (-r.get("success_rate", 0), _latency_key(r))),
+                "no zero-priced model advertised; fell back to reliability then "
+                "latency - true per-token cost is not collected")
+    return sorted(rows, key=lambda r: (-r.get("score", 0), _latency_key(r))), None
+
+
+def _latency_key(row: dict):
+    lat = row.get("median_latency_ms")
+    return (0, lat) if lat is not None else (1, 0.0)
+
+
 def recommend(ranking: list[dict], profile: str) -> dict:
     profile = (profile or "capable").lower()
-    usable = [r for r in ranking
-              if r["score"] > 0
-              and r["verdict"] not in ("dead", "quota_blocked", "auth_error",
-                                       "failing", "stale")]
-    note = None
     criteria = PROFILE_HINTS.get(profile, PROFILE_HINTS["capable"])
+    usable = usable_for_routing(ranking)
     if not usable:
         if any(r.get("verdict") == "stale" for r in ranking):
             return {"profile": profile, "criteria": criteria, "picks": [],
@@ -917,26 +996,9 @@ def recommend(ranking: list[dict], profile: str) -> dict:
         return {"profile": profile, "criteria": criteria, "picks": [],
                 "note": "no model has a passing score yet"}
 
-    if profile == "fast":
-        fast_ok = [r for r in usable if r["success_rate"] >= FAST_MIN_SUCCESS]
-        if not fast_ok:
-            return {"profile": profile, "criteria": criteria, "picks": [],
-                    "note": f"no model meets the {FAST_MIN_SUCCESS:.0f}% success bar for 'fast'"}
-        fast_ok.sort(key=lambda r: (r["median_latency_ms"]
-                                    if r["median_latency_ms"] is not None else 1e12))
-        usable = fast_ok
-    elif profile == "cheap":
-        free = [r for r in usable if _zero_priced(r)]
-        if free:
-            free.sort(key=lambda r: (-r["success_rate"], r["median_latency_ms"] or 1e12))
-            usable = free
-            note = "zero-priced models (endpoint advertises $0 input/output)"
-        else:
-            usable.sort(key=lambda r: (-r["success_rate"], r["median_latency_ms"] or 1e12))
-            note = ("no zero-priced model advertised; fell back to reliability then "
-                    "latency - true per-token cost is not collected")
-    else:
-        usable.sort(key=lambda r: (-r["score"], r["median_latency_ms"] or 1e12))
+    ordered, note = order_for_profile(usable, profile)
+    if not ordered:
+        return {"profile": profile, "criteria": criteria, "picks": [], "note": note}
 
     return {
         "profile": profile,
@@ -947,7 +1009,7 @@ def recommend(ranking: list[dict], profile: str) -> dict:
              "median_latency_ms": r["median_latency_ms"],
              "success_rate": r["success_rate"], "verdict": r["verdict"],
              "attempts": r["attempts"], "age_hours": r.get("age_hours")}
-            for i, r in enumerate(usable[:5])
+            for i, r in enumerate(ordered[:5])
         ],
     }
 

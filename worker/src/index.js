@@ -453,7 +453,7 @@ async function handleMcp(env, req, msg) {
     return jsonrpc(id, {
       protocolVersion: '2025-06-18',
       capabilities: { tools: {} },
-      serverInfo: { name: 'modellens-x402', version: '0.1.6' },
+      serverInfo: { name: 'modellens-x402', version: '0.2.0' },
     });
   }
   if (method && method.startsWith('notifications/')) return null;
@@ -575,7 +575,7 @@ export default {
     }
 
     if (url.pathname === '/health' && req.method === 'GET') {
-      return Response.json({ ok: true, server: 'modellens-x402-worker', version: '0.1.6' });
+      return Response.json({ ok: true, server: 'modellens-x402-worker', version: '0.2.0' });
     }
 
     // ingest: being pushes history + models snapshots

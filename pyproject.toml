@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "modellens-mcp"
-version = "0.1.6"
-description = "See which of your models actually works. MCP server + CLI that discovers, probes, ranks and recommends models across OpenAI-compatible gateways."
+version = "0.2.0"
+description = "See which of your models actually works. MCP server, CLI and evidence-based routing proxy that discovers, probes, ranks and recommends models across OpenAI-compatible gateways."
 readme = "README.md"
 license = { text = "MIT" }
 requires-python = ">=3.9"
@@ -33,6 +33,7 @@ Issues = "https://github.com/Greatbeing/modellens/issues"
 
 [project.scripts]
 modellens = "modellens:main"
+modellens-proxy = "modellens_proxy:main"
 
 [tool.setuptools]
-py-modules = ["modellens"]
+py-modules = ["modellens", "modellens_proxy"]

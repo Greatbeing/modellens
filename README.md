@@ -210,6 +210,89 @@ instead of being overwritten.
 
 ---
 
+## Proxy: route on evidence
+
+`modellens_proxy.py` is an OpenAI-compatible `/v1/chat/completions` proxy that
+picks the model from what ModelLens measured, then fails over when upstream
+misbehaves. Point your client at it and send `model: "auto"`:
+
+```bash
+python3 modellens.py --once probe --limit 20 --check-tools   # seed the evidence
+python3 modellens_proxy.py --config config.json --data history.json
+# → modellens-proxy on http://127.0.0.1:8766
+
+curl -s localhost:8766/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"auto:fast","messages":[{"role":"user","content":"hi"}]}'
+```
+
+A **real model id passes through untouched**, so the proxy is drop-in: existing
+clients keep working, and only `auto*` requests are routed.
+
+| alias | picks |
+|---|---|
+| `auto` | the configured default profile |
+| `auto:fast` | lowest median latency among models ≥90% success |
+| `auto:capable` | highest quality score |
+| `auto:cheap` | zero-priced models when the endpoint advertises pricing |
+| `auto:balanced` | score per second of latency |
+
+Every response says what happened, so a routing decision is never a mystery:
+
+```
+X-Modellens-Model: gpt-4o          X-Modellens-Reason: best|sticky|explore
+X-Modellens-Endpoint: a            X-Modellens-Attempts: 1
+X-Modellens-Profile: fast          X-Modellens-Evidence: probe n=12, age=0.1h
+X-Modellens-Fallback-From: a/mini  (only when a retry happened)
+```
+
+`config.json` gains an optional `proxy` section:
+
+```json
+{
+  "endpoints": [
+    {"name": "a", "base_url": "http://127.0.0.1:3425/v1", "api_key": "sk-...",
+     "capabilities": {"gpt-4o": {"tools": true, "json": true, "vision": true,
+                                 "ctx": 128000}}}
+  ],
+  "proxy": {
+    "listen": "127.0.0.1:8766",
+    "profile": "capable",
+    "table_ttl_s": 30,
+    "max_attempts": 3,
+    "explore_ratio": 0.05,
+    "sticky_ttl_s": 1800,
+    "probe": {"enabled": true, "interval_s": 900, "limit": 3},
+    "deny": ["*-preview"]
+  }
+}
+```
+
+Operational endpoints: `GET /modellens/table` (every candidate plus why it was
+blocked), `GET /modellens/explain` (dry-run a decision), `GET /modellens/health`,
+`GET /modellens/metrics` (Prometheus). `X-Modellens-Dry-Run: 1` returns the
+decision without calling any upstream — the safe way to try it in production.
+
+Behaviour worth knowing:
+
+- **Failover only before the first byte.** After bytes reach the client a retry
+  would duplicate output and the token bill, so the error is surfaced instead.
+- **A 4xx is never retried** and never recorded as a model failure: it is the
+  request's or the key's fault, and recording it would poison the score.
+- **Capabilities are three-state.** `stream`/`tools` come from probes; `json`,
+  `vision` and the context window cannot be measured, so declare them under
+  `capabilities` (or set `permissive_caps: true` to route anyway). Requests that
+  need a tool call skip models whose `tools` was never verified.
+- **Sessions stick.** A conversation stays on one model (`X-Modellens-Session`
+  or a hash of the system prompt) so multi-turn quality does not flap.
+- **Exploration is deliberate and bounded** (top-K, above the success bar), and
+  the background prober re-measures the stalest models — without that the
+  runner-up starves, goes stale and is gone exactly when it is needed.
+- **Proxy traffic is recorded** with `source: "proxy"`, so routing decisions
+  improve from real traffic while probe evidence stays the honest baseline.
+
+---
+
 ## CLI
 
 The server doubles as a command-line tool:
