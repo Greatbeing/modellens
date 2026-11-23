@@ -2,7 +2,7 @@
 // Run: node --test test/   (from worker/, zero dependencies)
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import worker, { timingSafeEqual } from '../src/index.js';
+import worker, { timingSafeEqual, paymentRequirements, PROBE_TIMEOUT_S } from '../src/index.js';
 
 const PAYLOAD = btoa(JSON.stringify({ x402Version: 1, scheme: 'exact', payload: { sig: '0xdead' } }));
 
@@ -103,6 +103,16 @@ test('paid tool without payment returns 402 with a challenge', async () => {
   }), env());
   assert.equal(res.status, 402);
   assert.ok(res.headers.get('PAYMENT-REQUIRED'));
+});
+
+test('probe authorization outlives the call; quick tools stay short', () => {
+  // Settlement happens after execution: a 60 s window expired mid-probe and
+  // the operator was never paid.
+  const probe = paymentRequirements(50000, 'https://w/mcp', 'ModelLens probe',
+                                    '0xabc', PROBE_TIMEOUT_S);
+  assert.ok(probe.maxTimeoutSeconds >= 300, `got ${probe.maxTimeoutSeconds}`);
+  const quick = paymentRequirements(10000, 'https://w/mcp', 'ModelLens ranking', '0xabc');
+  assert.equal(quick.maxTimeoutSeconds, 60);
 });
 
 test('payment is verified, then the tool runs, then it settles', async () => {

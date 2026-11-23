@@ -19,6 +19,7 @@ import os
 import socket
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import unittest
@@ -262,6 +263,60 @@ class PaymentFlowTest(unittest.TestCase):
         self.assertEqual(st, 200)
         self.assertNotIn("settle", order)  # caller must not be charged
         self.assertTrue(json.loads(body)["result"]["isError"])
+
+    def test_tool_failure_does_not_leak_the_exception_text(self):
+        S = self.S
+        S.facilitator = lambda path, body: {"isValid": True}
+
+        def boom(ctx, args):
+            # The marker MUST reach the log and MUST NOT reach the caller.
+            raise RuntimeError("upstream 500: postgres://app:topsecret-db-pass@10.0.0.5/db")
+
+        S._tool_fn = lambda name: boom
+        st, _, body = self._paid_call()
+        text = json.loads(body)["result"]["content"][0]["text"]
+        self.assertEqual(st, 200)
+        self.assertNotIn("topsecret-db-pass", text)   # no credential to a stranger
+        self.assertNotIn("10.0.0.5", text)
+        self.assertIn("RuntimeError", text)      # the type is still useful
+        self.assertIn("not charged", text)
+
+    def test_probe_authorization_covers_the_worst_case_execution(self):
+        # Settlement happens after execution, so the signed authorization must
+        # stay valid longer than the slowest possible probe.
+        S = self.S
+        for name in ("probe",):
+            req = S.payment_requirements("50000", "https://h/mcp", f"ModelLens {name}",
+                                         max_timeout=S.PAYMENT_TIMEOUT_S)
+            self.assertGreaterEqual(req["maxTimeoutSeconds"], S.PROBE_WORST_CASE_S,
+                                    "authorization would expire mid-call")
+        self.assertGreater(S.PAYMENT_TIMEOUT_S, S.PROBE_WORST_CASE_S)
+        quick = S.payment_requirements("10000", "https://h/mcp", "ModelLens ranking")
+        self.assertEqual(quick["maxTimeoutSeconds"], S.QUICK_TOOL_TIMEOUT_S)
+        self.assertLessEqual(S.QUICK_TOOL_TIMEOUT_S, 60)
+
+    def test_settlement_failure_after_delivery_is_parked_for_ops(self):
+        S = self.S
+        with tempfile.TemporaryDirectory() as tmp:
+            old = S.PENDING_LOG
+            S.PENDING_LOG = os.path.join(tmp, "pending.jsonl")
+            try:
+                def fake_facilitator(path, body):
+                    return {"isValid": True} if path == "/verify" else {
+                        "success": False, "errorReason": "expired"}
+                S.facilitator = fake_facilitator
+                S._tool_fn = lambda name: (lambda ctx, args: "the answer")
+                st, _, body = self._paid_call()
+                self.assertEqual(st, 200)
+                self.assertIn("the answer", body)      # answer wins over collection
+                with open(S.PENDING_LOG, encoding="utf-8") as fh:
+                    records = [json.loads(line) for line in fh if line.strip()]
+                self.assertEqual(len(records), 1)
+                self.assertEqual(records[0]["tool"], "probe")
+                self.assertIn("expired", records[0]["error"])
+                self.assertIn("paymentPayload", records[0])
+            finally:
+                S.PENDING_LOG = old
 
     def test_invalid_payment_never_executes(self):
         S = self.S

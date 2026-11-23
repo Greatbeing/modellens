@@ -20,3 +20,4 @@ worker/node_modules/
 worker/.wrangler/
 worker/.dev.vars
 worker/$null
+settlements_pending.jsonl

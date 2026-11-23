@@ -33,6 +33,8 @@ import base64
 import json
 import os
 import sys
+import threading
+import time
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -58,6 +60,28 @@ PORT = int(os.environ.get("X402_PORT", "8765"))
 PROBE_LIMIT_CAP = int(os.environ.get("X402_MAX_PROBE_LIMIT", "20"))
 PROBE_WORKERS_CAP = int(os.environ.get("X402_MAX_PROBE_WORKERS", "4"))
 GLOBAL_LIMIT_CAP = 200
+
+# A hosted probe must fit inside the payment authorization window. The caller
+# signs an authorization valid for maxTimeoutSeconds, and settlement happens
+# only AFTER the tool runs, so an execution longer than that window expires the
+# authorization: the caller gets their answer and the operator is never paid.
+# Worst case = ceil(limit / workers) waves x (chat timeout + stream timeout).
+# Shorten the per-request timeout for hosted mode too: a hung upstream must not
+# hold a paid call for 90 s per model.
+PROBE_TIMEOUT_S = int(os.environ.get("X402_PROBE_TIMEOUT", "30"))
+ml.PROBE_TIMEOUT = PROBE_TIMEOUT_S
+PROBE_WAVES = -(-PROBE_LIMIT_CAP // max(1, PROBE_WORKERS_CAP))  # ceil division
+PROBE_WORST_CASE_S = PROBE_WAVES * PROBE_TIMEOUT_S * 2
+PAYMENT_TIMEOUT_S = max(120, PROBE_WORST_CASE_S + 60)  # + margin to settle
+QUICK_TOOL_TIMEOUT_S = 60  # ranking/recommend/report only read local state
+
+# Settlement can fail after the answer was already delivered (expired
+# authorization, facilitator outage). Nothing must block the caller, but the
+# operator needs a durable record to collect it later.
+PENDING_LOG = os.environ.get(
+    "X402_PENDING_LOG",
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), "settlements_pending.jsonl"))
+_pending_lock = threading.Lock()
 
 PRICES = {  # atomic USDC (6 decimals); 0 = free
     "list_models": "0",
@@ -88,7 +112,8 @@ def unb64url(s: str) -> bytes:
     return base64.urlsafe_b64decode(s + pad)
 
 
-def payment_requirements(amount: str, resource: str, description: str) -> dict:
+def payment_requirements(amount: str, resource: str, description: str,
+                         max_timeout: int = QUICK_TOOL_TIMEOUT_S) -> dict:
     return {
         "scheme": "exact",
         "network": NETWORK,
@@ -97,7 +122,9 @@ def payment_requirements(amount: str, resource: str, description: str) -> dict:
         "description": description,
         "mimeType": "application/json",
         "payTo": PAY_TO,
-        "maxTimeoutSeconds": 60,
+        # The caller signs an authorization valid for this long; settlement
+        # happens after execution, so it must cover the whole tool call.
+        "maxTimeoutSeconds": max_timeout,
         "asset": USDC_BASE,
         "extra": {"name": "USDC", "version": "2"},
     }
@@ -155,6 +182,33 @@ def settle_payment(payload, req: dict) -> dict:
         return {"ok": True, "tx": s.get("transaction"), "error": None}
     except Exception as e:
         return {"ok": False, "tx": None, "error": f"facilitator error: {e}"}
+
+
+def record_pending_settlement(tool: str, payload, req: dict, error: str) -> None:
+    """Keep a durable record of work delivered but not collected.
+
+    Settlement runs after execution, so it can fail on an expired authorization
+    or a facilitator outage. The caller already has the answer and must not be
+    charged twice, so the payment payload is parked here for the operator to
+    settle later instead of being lost with the response.
+    """
+    try:
+        line = json.dumps({
+            "at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "tool": tool,
+            "error": error,
+            "paymentPayload": payload,
+            "paymentRequirements": req,
+        }, ensure_ascii=False)
+        with _pending_lock:
+            parent = os.path.dirname(os.path.abspath(PENDING_LOG))
+            os.makedirs(parent, exist_ok=True)
+            with open(PENDING_LOG, "a", encoding="utf-8") as fh:
+                fh.write(line + "\n")
+                fh.flush()
+                os.fsync(fh.fileno())
+    except Exception as exc:            # never fail a delivered call over bookkeeping
+        sys.stderr.write(f"could not record pending settlement for {tool}: {exc}\n")
 
 
 def _sanitize_args(name, args) -> dict:
@@ -315,7 +369,12 @@ class Handler(BaseHTTPRequestHandler):
             resource = self._resource()
             if price > 0:
                 xpay = self.headers.get("X-PAYMENT") or self.headers.get("X-Payment")
-                req = payment_requirements(str(price), resource, f"ModelLens {name}")
+                # probe runs real upstream requests, so its authorization must
+                # stay valid for the whole call; the read-only tools answer
+                # instantly.
+                timeout_s = PAYMENT_TIMEOUT_S if name == "probe" else QUICK_TOOL_TIMEOUT_S
+                req = payment_requirements(str(price), resource, f"ModelLens {name}",
+                                           max_timeout=timeout_s)
                 if not xpay:
                     challenge = {"x402Version": 1, "accepts": [req], "error": "payment required"}
                     body = {"jsonrpc": "2.0", "id": mid,
@@ -334,9 +393,13 @@ class Handler(BaseHTTPRequestHandler):
                 try:
                     text = fn(CTX, args)
                 except Exception as e:
-                    sys.stderr.write(f"tool {name} failed after verify; not settling: {e}\n")
+                    # Nothing was settled, so the caller was not charged. Log the
+                    # detail; return only the exception type (a raw message can
+                    # leak paths, upstream bodies and key material to a stranger).
+                    sys.stderr.write(f"tool {name} failed after verify; not settling: {e!r}\n")
                     self._json(200, {"jsonrpc": "2.0", "id": mid,
-                                     "result": {"content": [{"type": "text", "text": f"tool error: {e}"}],
+                                     "result": {"content": [{"type": "text",
+                                                             "text": f"tool error ({type(e).__name__}) — not charged"}],
                                                 "isError": True}})
                     return
                 s = settle_payment(v["payload"], req)
@@ -345,9 +408,12 @@ class Handler(BaseHTTPRequestHandler):
                     headers["PAYMENT-RESPONSE"] = b64url(json.dumps(
                         {"x402Version": 1, "transaction": s["tx"], "network": NETWORK}).encode())
                 else:
-                    # The caller already got their answer; a settlement failure
-                    # is the operator's problem — log it, don't punish them.
+                    # The tool already ran and the caller has their answer:
+                    # answering 402 here would make a retrying client run the
+                    # tool (and pay) again. Deliver, log, and park the payment
+                    # for later collection.
                     sys.stderr.write(f"settle failed for {name}: {s['error']}\n")
+                    record_pending_settlement(name, v["payload"], req, s["error"])
                 self._json(200, {"jsonrpc": "2.0", "id": mid,
                                  "result": {"content": [{"type": "text", "text": text}]}},
                             headers)
@@ -356,8 +422,10 @@ class Handler(BaseHTTPRequestHandler):
             try:
                 text = fn(CTX, args)
             except Exception as e:
+                sys.stderr.write(f"tool {name} failed: {e!r}\n")
                 self._json(200, {"jsonrpc": "2.0", "id": mid,
-                                 "result": {"content": [{"type": "text", "text": f"tool error: {e}"}],
+                                 "result": {"content": [{"type": "text",
+                                                         "text": f"tool error ({type(e).__name__})"}],
                                             "isError": True}})
                 return
             self._json(200, {"jsonrpc": "2.0", "id": mid,

@@ -122,7 +122,15 @@ function unb64url(s) {
   return bytes;
 }
 
-function paymentRequirements(amount, resource, description, payTo) {
+// Settlement happens AFTER the tool runs, so the authorization the caller
+// signs must stay valid for the whole call. probe is forwarded to the backend,
+// whose caps bound it to ~300 s worst case; the read-only tools answer from KV
+// instantly. Advertising 60 s for probe expired the authorization mid-call and
+// the operator was never paid.
+const PROBE_TIMEOUT_S = 360;
+const QUICK_TOOL_TIMEOUT_S = 60;
+
+function paymentRequirements(amount, resource, description, payTo, maxTimeoutSeconds) {
   return {
     scheme: 'exact',
     network: NETWORK,
@@ -131,7 +139,7 @@ function paymentRequirements(amount, resource, description, payTo) {
     description,
     mimeType: 'application/json',
     payTo,
-    maxTimeoutSeconds: 60,
+    maxTimeoutSeconds: maxTimeoutSeconds || QUICK_TOOL_TIMEOUT_S,
     asset: USDC_BASE,
     extra: { name: 'USDC', version: '2' },
   };
@@ -445,7 +453,8 @@ async function handleMcp(env, req, msg) {
 
     if (price > 0) {
       const xpay = req.headers.get('X-PAYMENT') || req.headers.get('x-payment');
-      const req402 = paymentRequirements(price, resource, `ModelLens ${name}`, env.X402_PAY_TO);
+      const timeoutS = name === 'probe' ? PROBE_TIMEOUT_S : QUICK_TOOL_TIMEOUT_S;
+      const req402 = paymentRequirements(price, resource, `ModelLens ${name}`, env.X402_PAY_TO, timeoutS);
       if (!xpay) {
         const challenge = { x402Version: 1, accepts: [req402], error: 'payment required' };
         return {
@@ -463,17 +472,28 @@ async function handleMcp(env, req, msg) {
       try {
         text = await runTool(env, name, args);
       } catch (e) {
-        console.error(`tool ${name} failed after verify; not settling: ${e && e.message}`);
-        return { status: 200, body: jsonrpc(id, { content: [{ type: 'text', text: 'tool error: ' + (e && e.message) }], isError: true }) };
+        // Nothing was settled, so the caller was not charged. Keep the detail
+        // in the log; return only the exception type, never e.message/stacks.
+        console.error(`tool ${name} failed after verify; not settling: ${e && e.stack ? e.stack : e}`);
+        return {
+          status: 200,
+          body: jsonrpc(id, {
+            content: [{ type: 'text', text: `tool error (${(e && e.name) || 'Error'}) — not charged` }],
+            isError: true,
+          }),
+        };
       }
       const s = await settlePayment(env, v.payload, req402);
       const headers = {};
       if (s.ok) {
         headers['PAYMENT-RESPONSE'] = b64url(new TextEncoder().encode(JSON.stringify({ x402Version: 1, transaction: s.tx, network: NETWORK })));
       } else {
-        // The caller got their answer; the settlement failure is the
-        // operator's problem — log it, don't punish the caller.
-        console.error(`settle failed for ${name}: ${s.error}`);
+        // The tool already ran and the caller has their answer: answering 402
+        // here would make a retrying client run the tool (and pay) again.
+        // Deliver, log a reconciliation record, and let ops settle it later.
+        console.error('settle failed after delivery', JSON.stringify({
+          tool: name, error: s.error, paymentPayload: v.payload, requirements: req402,
+        }));
       }
       return {
         status: 200,
@@ -589,4 +609,5 @@ export default {
 };
 
 // Named exports for unit tests (wrangler only uses the default export).
-export { median, scoreModel, aggregate, round1, formatAge, parseLimit, timingSafeEqual };
+export { median, scoreModel, aggregate, round1, formatAge, parseLimit, timingSafeEqual,
+         paymentRequirements, PROBE_TIMEOUT_S, QUICK_TOOL_TIMEOUT_S };
