@@ -244,6 +244,8 @@ X-Modellens-Model: gpt-4o          X-Modellens-Reason: best|sticky|explore
 X-Modellens-Endpoint: a            X-Modellens-Attempts: 1
 X-Modellens-Profile: fast          X-Modellens-Evidence: probe n=12, age=0.1h
 X-Modellens-Fallback-From: a/mini  (only when a retry happened)
+X-Modellens-Tokens: 1000+500       (non-stream only, from the upstream usage block)
+X-Modellens-Cost-USD: 0.00125      (only when the endpoint advertises pricing)
 ```
 
 `config.json` gains an optional `proxy` section:
@@ -262,16 +264,18 @@ X-Modellens-Fallback-From: a/mini  (only when a retry happened)
     "max_attempts": 3,
     "explore_ratio": 0.05,
     "sticky_ttl_s": 1800,
-    "probe": {"enabled": true, "interval_s": 900, "limit": 3},
+    "probe": {"enabled": true, "interval_s": 900, "limit": 3, "check_tools": true},
+    "pool": {"max_idle": 8, "idle_s": 60},
     "deny": ["*-preview"]
   }
 }
 ```
 
 Operational endpoints: `GET /modellens/table` (every candidate plus why it was
-blocked), `GET /modellens/explain` (dry-run a decision), `GET /modellens/health`,
-`GET /modellens/metrics` (Prometheus). `X-Modellens-Dry-Run: 1` returns the
-decision without calling any upstream — the safe way to try it in production.
+blocked), `GET /modellens/explain` (dry-run a decision), `GET /modellens/health`
+(spend, breakers, pool), `GET /modellens/metrics` (Prometheus: requests,
+failovers, tokens, cost per model, pool hits). `X-Modellens-Dry-Run: 1` returns
+the decision without calling any upstream — the safe way to try it in production.
 
 Behaviour worth knowing:
 
@@ -282,7 +286,17 @@ Behaviour worth knowing:
 - **Capabilities are three-state.** `stream`/`tools` come from probes; `json`,
   `vision` and the context window cannot be measured, so declare them under
   `capabilities` (or set `permissive_caps: true` to route anyway). Requests that
-  need a tool call skip models whose `tools` was never verified.
+  need a tool call skip models whose `tools` was never verified — enable
+  `probe.check_tools` and the prober turns that "unknown" into a real answer.
+- **Spend is accounted, not guessed.** Token counts come from the upstream
+  `usage` block (including the final SSE chunk when the gateway sends one) and
+  cost from the endpoint's advertised per-million pricing. Missing either yields
+  no number rather than an invented one; totals land in `/modellens/metrics` and
+  in each history row (`prompt_tokens`, `completion_tokens`, `cost_usd`).
+- **Connections are pooled.** Chat requests reuse a keep-alive connection per
+  endpoint (`pool.max_idle`, `pool.idle_s`), so the proxy does not pay a TCP/TLS
+  handshake per call; a connection the peer closed while idle is retried once on
+  a fresh socket instead of surfacing as an upstream failure.
 - **Sessions stick.** A conversation stays on one model (`X-Modellens-Session`
   or a hash of the system prompt) so multi-turn quality does not flap.
 - **Exploration is deliberate and bounded** (top-K, above the success bar), and

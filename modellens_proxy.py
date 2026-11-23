@@ -99,6 +99,13 @@ class ProxyConfig:
         self.probe_interval_s = float(probe.get("interval_s", 900))
         self.probe_limit = max(1, int(probe.get("limit", 3)))
         self.probe_check_stream = bool(probe.get("check_stream", True))
+        # Tool support cannot be known without asking, and a request that needs
+        # tools is gated on it: probing it here is what turns "unknown" into a
+        # routing decision instead of a 503.
+        self.probe_check_tools = bool(probe.get("check_tools", False))
+        pool = raw.get("pool") or {}
+        self.pool_max_idle = max(0, int(pool.get("max_idle", 8)))
+        self.pool_idle_s = float(pool.get("idle_s", 60))
         breaker = raw.get("breaker") or {}
         self.breaker_threshold = max(1, int(breaker.get("fail_threshold", 3)))
         self.breaker_open_s = float(breaker.get("open_s", 30))
@@ -570,6 +577,73 @@ class Upstream:
     opened_ms: float
     error: str | None = None
     error_type: str | None = None
+    endpoint: str = ""
+    reused: bool = False
+
+
+class ConnPool:
+    """Keep-alive connections per endpoint.
+
+    A fresh TCP (and TLS) handshake per chat request is pure added latency on
+    top of the model's own, and the proxy's whole promise is speed. Idle
+    connections are bounded and expire, so a quiet endpoint does not pin sockets.
+    """
+
+    def __init__(self, max_idle: int = 8, idle_ttl_s: float = 60):
+        self.max_idle = max_idle
+        self.idle_ttl_s = idle_ttl_s
+        self._lock = threading.Lock()
+        self._idle: dict[str, list[tuple[http.client.HTTPConnection, float]]] = {}
+        self.hits = 0
+        self.misses = 0
+
+    def acquire(self, ep: ml.Endpoint, timeout: float) -> tuple[http.client.HTTPConnection, bool]:
+        now = time.monotonic()
+        with self._lock:
+            bucket = self._idle.get(ep.name)
+            while bucket:
+                conn, since = bucket.pop()
+                if now - since <= self.idle_ttl_s:
+                    self.hits += 1
+                    try:
+                        conn.timeout = timeout      # applied on the next socket op
+                    except Exception:
+                        pass
+                    return conn, True
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+        self.misses += 1
+        conn, _path = _conn_for(ep, timeout)
+        return conn, False
+
+    def release(self, ep_name: str, conn: http.client.HTTPConnection) -> None:
+        if self.max_idle <= 0:
+            try:
+                conn.close()
+            except Exception:
+                pass
+            return
+        with self._lock:
+            bucket = self._idle.setdefault(ep_name, [])
+            if len(bucket) >= self.max_idle:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+                return
+            bucket.append((conn, time.monotonic()))
+
+    def close_all(self) -> None:
+        with self._lock:
+            for bucket in self._idle.values():
+                for conn, _ in bucket:
+                    try:
+                        conn.close()
+                    except Exception:
+                        pass
+            self._idle.clear()
 
 
 def _conn_for(ep: ml.Endpoint, timeout: float):
@@ -584,31 +658,54 @@ def _conn_for(ep: ml.Endpoint, timeout: float):
     return conn, path
 
 
+def _stale_connection_error(exc: Exception) -> bool:
+    """A pooled connection the server already closed: retry once on a new one."""
+    return isinstance(exc, (http.client.RemoteDisconnected, http.client.BadStatusLine,
+                            ConnectionResetError, BrokenPipeError, ConnectionAbortedError))
+
+
 def open_upstream(ep: ml.Endpoint, model: str, payload: bytes, timeout: float,
-                  client_auth: str | None, cfg: ProxyConfig) -> Upstream:
+                  client_auth: str | None, cfg: ProxyConfig,
+                  pool: ConnPool | None = None) -> Upstream:
     """POST upstream. Always returns a handle; transport failure lands in .error."""
     started = time.monotonic()
-    conn = None
-    try:
-        conn, path = _conn_for(ep, timeout)
-        headers = {"Content-Type": "application/json",
-                   "Accept": "text/event-stream, application/json"}
-        auth = client_auth if (client_auth and cfg.forward_client_auth) else None
-        headers["Authorization"] = auth or f"Bearer {ep.api_key or 'modellens'}"
-        conn.request("POST", path, body=payload, headers=headers)
-        resp = conn.getresponse()
-        return Upstream(conn, resp, model, resp.status,
-                        (time.monotonic() - started) * 1000.0)
-    except Exception as exc:
-        err_type, _ = ml._classify_network_error(exc)
-        if conn is not None:
+    _, path = _conn_for(ep, timeout)
+    headers = {"Content-Type": "application/json",
+               "Accept": "text/event-stream, application/json"}
+    auth = client_auth if (client_auth and cfg.forward_client_auth) else None
+    headers["Authorization"] = auth or f"Bearer {ep.api_key or 'modellens'}"
+
+    for attempt in (0, 1):
+        reused = False
+        conn = None
+        try:
+            if pool is not None and attempt == 0:
+                conn, reused = pool.acquire(ep, timeout)
+            else:
+                conn, _ = _conn_for(ep, timeout)
+            conn.request("POST", path, body=payload, headers=headers)
+            resp = conn.getresponse()
+            return Upstream(conn, resp, model, resp.status,
+                            (time.monotonic() - started) * 1000.0,
+                            endpoint=ep.name, reused=reused)
+        except Exception as exc:
             try:
-                conn.close()
+                if conn is not None:
+                    conn.close()
             except Exception:
                 pass
-        return Upstream(conn, None, model, 0,
-                        (time.monotonic() - started) * 1000.0,
-                        error=str(exc)[:300], error_type=err_type)
+            # A keep-alive socket the peer closed while idle fails on the first
+            # write; that is expected, not an outage — one clean retry fixes it.
+            if attempt == 0 and reused and _stale_connection_error(exc):
+                continue
+            err_type, _ = ml._classify_network_error(exc)
+            return Upstream(conn, None, model, 0,
+                            (time.monotonic() - started) * 1000.0,
+                            error=str(exc)[:300], error_type=err_type,
+                            endpoint=ep.name, reused=reused)
+    return Upstream(None, None, model, 0, (time.monotonic() - started) * 1000.0,
+                    error="connection retry exhausted", error_type="conn_error",
+                    endpoint=ep.name)
 
 
 def read_chunk(resp: http.client.HTTPResponse, n: int = 8192) -> bytes:
@@ -623,15 +720,110 @@ def read_chunk(resp: http.client.HTTPResponse, n: int = 8192) -> bytes:
     return resp.read(n)
 
 
-def close_upstream(up: Upstream | None) -> None:
+def close_upstream(up: Upstream | None, pool: ConnPool | None = None,
+                   reusable: bool = False) -> None:
+    """Close, or hand the connection back to the pool when the body was read out.
+
+    `resp.isclosed()` is not the test: http.client closes its *response* object
+    once the body is complete even on a keep-alive connection. The reusable
+    signal is `resp.will_close`, plus the caller telling us it read the body to
+    the end (an aborted stream must not be pooled).
+    """
     if up is None:
         return
-    for closer in (up.resp, up.conn):
+    keep = (reusable and pool is not None and up.conn is not None
+            and up.resp is not None
+            and not getattr(up.resp, "will_close", True))
+    try:
+        if up.resp is not None:
+            up.resp.close()
+    except Exception:
+        pass
+    if keep:
         try:
-            if closer is not None:
-                closer.close()
+            pool.release(up.endpoint, up.conn)
+            return
         except Exception:
             pass
+    try:
+        if up.conn is not None:
+            up.conn.close()
+    except Exception:
+        pass
+
+
+# --------------------------------------------------------------------------
+# Cost accounting
+# --------------------------------------------------------------------------
+
+def usage_from_json(data: bytes | None) -> dict | None:
+    """prompt/completion token counts from an OpenAI response body, if present."""
+    if not data:
+        return None
+    try:
+        obj = json.loads(data)
+    except Exception:
+        return None
+    return _usage_of(obj)
+
+
+def _usage_of(obj) -> dict | None:
+    if not isinstance(obj, dict):
+        return None
+    usage = obj.get("usage")
+    if not isinstance(usage, dict):
+        return None
+    prompt = usage.get("prompt_tokens")
+    completion = usage.get("completion_tokens")
+    if not isinstance(prompt, (int, float)) and not isinstance(completion, (int, float)):
+        return None
+    return {"prompt": int(prompt) if isinstance(prompt, (int, float)) else None,
+            "completion": int(completion) if isinstance(completion, (int, float)) else None}
+
+
+def usage_from_sse(chunk: bytes) -> dict | None:
+    """Usage from an SSE chunk (OpenAI sends it in a late chunk with usage).
+
+    Only chunks that mention "usage" are parsed, so the common case costs a
+    substring check rather than a JSON parse per token.
+    """
+    if b'"usage"' not in chunk:
+        return None
+    for line in chunk.split(b"\n"):
+        line = line.strip()
+        if not line.startswith(b"data:"):
+            continue
+        payload = line[5:].strip()
+        if payload == b"[DONE]":
+            continue
+        try:
+            found = _usage_of(json.loads(payload))
+        except Exception:
+            continue
+        if found:
+            return found
+    return None
+
+
+def compute_cost(pricing: dict, usage: dict | None) -> float | None:
+    """USD cost from advertised per-million pricing; None when unknown.
+
+    Pricing is advertised per million tokens. A missing price or a missing token
+    count yields None rather than a guess: a "cheap" recommendation built on an
+    invented number is worse than an honest gap.
+    """
+    if not usage:
+        return None
+    price_in = (pricing or {}).get("input")
+    price_out = (pricing or {}).get("output")
+    total, known = 0.0, False
+    if isinstance(price_in, (int, float)) and usage.get("prompt") is not None:
+        total += usage["prompt"] / 1_000_000.0 * float(price_in)
+        known = True
+    if isinstance(price_out, (int, float)) and usage.get("completion") is not None:
+        total += usage["completion"] / 1_000_000.0 * float(price_out)
+        known = True
+    return round(total, 8) if known else None
 
 
 # --------------------------------------------------------------------------
@@ -758,6 +950,9 @@ class Prober(threading.Thread):
                 row = ml.probe_model(ep, cand.model,
                                      check_stream=self.app.cfg.probe_check_stream)
                 row["source"] = "probe"
+                if self.app.cfg.probe_check_tools and row.get("ok"):
+                    # This is what turns `tools: unknown` into a routable "yes".
+                    row["tools_ok"] = ml.probe_tools(ep, cand.model)
                 results.append(row)
                 self.app.record(row)
             self.last_run = time.time()
@@ -786,6 +981,7 @@ class App:
         self.discovery = Discovery(cfg)
         self.breaker = Breaker(cfg)
         self.sticky = Sticky(cfg.sticky_ttl_s)
+        self.pool = ConnPool(cfg.pool_max_idle, cfg.pool_idle_s)
         self.recorder = Recorder(self.ctx.store, synchronous=synchronous_records)
         self._table: Table | None = None
         self._table_lock = threading.Lock()
@@ -795,6 +991,8 @@ class App:
         self.counters = {
             "requests": 0, "routed": 0, "pinned": 0, "dry_run": 0,
             "failovers": 0, "errors": 0, "by_reason": {}, "by_model": {},
+            "tokens_input": 0, "tokens_output": 0, "cost_usd": 0.0,
+            "cost_by_model": {},
         }
         self.refresher = Refresher(self)
         self.prober = Prober(self)
@@ -823,6 +1021,7 @@ class App:
         self.refresher.stop()
         self.prober.stop()
         self.recorder.close()
+        self.pool.close_all()
 
     # -- counters -------------------------------------------------------
     def bump(self, key: str, model: str | None = None, reason: str | None = None) -> None:
@@ -834,6 +1033,21 @@ class App:
             if reason:
                 self.counters["by_reason"][reason] = \
                     self.counters["by_reason"].get(reason, 0) + 1
+
+    def note_usage(self, model: str, usage: dict | None,
+                   cost: float | None) -> None:
+        """Accumulate tokens and spend. Only what the upstream actually reported."""
+        if not usage and cost is None:
+            return
+        with self._counters_lock:
+            if usage:
+                self.counters["tokens_input"] += int(usage.get("prompt") or 0)
+                self.counters["tokens_output"] += int(usage.get("completion") or 0)
+            if cost is not None:
+                self.counters["cost_usd"] = round(
+                    self.counters["cost_usd"] + cost, 8)
+                per_model = self.counters["cost_by_model"]
+                per_model[model] = round(per_model.get(model, 0.0) + cost, 8)
 
     def snapshot_counters(self) -> dict:
         with self._counters_lock:
@@ -935,6 +1149,7 @@ class Handler(BaseHTTPRequestHandler):
                 "verdicts": table.verdict_counts(),
                 "breakers": self.app.breaker.snapshot(),
                 "sticky_sessions": len(self.app.sticky),
+                "pool": {"hits": self.app.pool.hits, "misses": self.app.pool.misses},
                 "counters": self.app.snapshot_counters(),
             })
         if path == "/modellens/metrics":
@@ -1056,7 +1271,7 @@ class Handler(BaseHTTPRequestHandler):
                 continue
             payload = json.dumps({**body, "model": cand.model}).encode()
             up = open_upstream(ep, cand.model, payload, timeout, client_auth,
-                               self.app.cfg)
+                               self.app.cfg, self.app.pool)
             attempts.append({"id": cand.id, "status": up.status,
                              "ms": round(up.opened_ms, 1), "error": up.error})
 
@@ -1083,10 +1298,13 @@ class Handler(BaseHTTPRequestHandler):
                         cand, decision, attempts, fallback_from).items()}})
 
             self.app.sticky.set(sticky_key, cand.id)
-            ok, total_ms, ttft_ms = self._relay(up, cand, decision, attempts,
-                                                fallback_from, need)
+            ok, total_ms, ttft_ms, usage, reusable = self._relay(
+                up, cand, decision, attempts, fallback_from, need)
+            cost = compute_cost(cand.pricing, usage)
             self.app.record(self._outcome(cand, up, ok, need, decision,
-                                          len(attempts), total_ms, ttft_ms))
+                                          len(attempts), total_ms, ttft_ms,
+                                          usage, cost))
+            self.app.note_usage(cand.model, usage, cost)
             return None
 
         self.app.bump("errors", reason="all_attempts_failed")
@@ -1103,12 +1321,15 @@ class Handler(BaseHTTPRequestHandler):
     # -- relaying -------------------------------------------------------
     def _relay(self, up: Upstream, cand: Cand, decision: dict,
                attempts: list[dict], fallback_from: str | None,
-               need: Need) -> tuple[bool, float, float | None]:
+               need: Need) -> tuple[bool, float, float | None, dict | None, bool]:
+        """Relay the upstream response. Returns (ok, total_ms, ttft, usage, reusable)."""
         started = time.monotonic()
         resp = up.resp
         headers = self._routing_headers(cand, decision, attempts, fallback_from)
         ctype = (resp.getheader("Content-Type") if resp is not None else None)
         ttft: float | None = None
+        usage: dict | None = None
+        reusable = False
         try:
             if need.stream:
                 self.send_response(resp.status)
@@ -1124,16 +1345,29 @@ class Handler(BaseHTTPRequestHandler):
                         break
                     if ttft is None:
                         ttft = (time.monotonic() - started) * 1000.0
+                    if usage is None:
+                        usage = usage_from_sse(chunk)
                     self.wfile.write(b"%x\r\n%s\r\n" % (len(chunk), chunk))
                     self.wfile.flush()
                 self.wfile.write(b"0\r\n\r\n")
                 self.wfile.flush()
+                reusable = True
             else:
                 data = resp.read(MAX_RESPONSE + 1)
                 if len(data) > MAX_RESPONSE:
                     self._send_json(502, _json_error(
                         "upstream response too large", "upstream_unavailable", 502))
-                    return False, (time.monotonic() - started) * 1000.0, None
+                    return False, (time.monotonic() - started) * 1000.0, None, None, False
+                reusable = True
+                usage = usage_from_json(data)
+                # Non-stream is the only case where the numbers are known before
+                # the headers go out, so only here can we announce them.
+                if usage:
+                    headers["X-Modellens-Tokens"] = (
+                        f"{usage.get('prompt') or 0}+{usage.get('completion') or 0}")
+                cost = compute_cost(cand.pricing, usage)
+                if cost is not None:
+                    headers["X-Modellens-Cost-USD"] = str(cost)
                 self.send_response(resp.status)
                 self.send_header("Content-Type", ctype or "application/json")
                 self.send_header("Content-Length", str(len(data)))
@@ -1142,17 +1376,17 @@ class Handler(BaseHTTPRequestHandler):
                 self.end_headers()
                 self.wfile.write(data)
                 self.wfile.flush()
-            return True, up.opened_ms + (time.monotonic() - started) * 1000.0, ttft
+            return True, up.opened_ms + (time.monotonic() - started) * 1000.0, ttft, usage, reusable
         except (BrokenPipeError, ConnectionAbortedError):
             # The client left: stop paying for the rest of the stream.
             self.app.bump("errors", reason="client_cancelled")
-            return False, (time.monotonic() - started) * 1000.0, ttft
+            return False, (time.monotonic() - started) * 1000.0, ttft, usage, False
         except Exception as exc:
             err_type, _ = ml._classify_network_error(exc)
             self.app.bump("errors", reason=f"relay_{err_type}")
-            return False, (time.monotonic() - started) * 1000.0, ttft
+            return False, (time.monotonic() - started) * 1000.0, ttft, usage, False
         finally:
-            close_upstream(up)
+            close_upstream(up, self.app.pool, reusable=reusable)
 
     def _routing_headers(self, cand: Cand, decision: dict,
                          attempts: list[dict], fallback_from: str | None) -> dict:
@@ -1175,8 +1409,9 @@ class Handler(BaseHTTPRequestHandler):
 
     def _outcome(self, cand: Cand, up: Upstream, ok: bool, need: Need,
                  decision: dict, attempt: int, latency_ms: float | None = None,
-                 ttft_ms: float | None = None) -> dict:
-        return {
+                 ttft_ms: float | None = None, usage: dict | None = None,
+                 cost: float | None = None) -> dict:
+        row = {
             "endpoint": cand.endpoint, "model": cand.model,
             "ok": bool(ok), "status": up.status,
             "latency_ms": round(latency_ms if latency_ms is not None else up.opened_ms, 1),
@@ -1193,6 +1428,12 @@ class Handler(BaseHTTPRequestHandler):
             "error": up.error or (None if ok else f"HTTP {up.status}"),
             "error_type": up.error_type,
         }
+        if usage:
+            row["prompt_tokens"] = usage.get("prompt")
+            row["completion_tokens"] = usage.get("completion")
+        if cost is not None:
+            row["cost_usd"] = cost
+        return row
 
     # -- admin ----------------------------------------------------------
     def _need_from_query(self) -> Need:
@@ -1295,7 +1536,19 @@ class Handler(BaseHTTPRequestHandler):
             f"modellens_proxy_failovers_total {c.get('failovers', 0)}",
             "# TYPE modellens_proxy_errors_total counter",
             f"modellens_proxy_errors_total {c.get('errors', 0)}",
+            "# TYPE modellens_proxy_tokens_total counter",
+            f'modellens_proxy_tokens_total{{kind="input"}} {c.get("tokens_input", 0)}',
+            f'modellens_proxy_tokens_total{{kind="output"}} {c.get("tokens_output", 0)}',
+            "# TYPE modellens_proxy_cost_usd_total counter",
+            f"modellens_proxy_cost_usd_total {round(c.get('cost_usd', 0.0), 8)}",
+            "# TYPE modellens_proxy_pool_hits_total counter",
+            f"modellens_proxy_pool_hits_total {self.app.pool.hits}",
+            f"modellens_proxy_pool_misses_total {self.app.pool.misses}",
         ]
+        for model, spend in sorted(c.get("cost_by_model", {}).items()):
+            safe = re.sub(r'["\n\\]', "_", model)
+            lines.append(
+                f'modellens_proxy_model_cost_usd_total{{model="{safe}"}} {spend}')
         for model, n in sorted(c.get("by_model", {}).items()):
             safe = re.sub(r'["\n\\]', "_", model)
             lines.append(f'modellens_proxy_model_requests_total{{model="{safe}"}} {n}')

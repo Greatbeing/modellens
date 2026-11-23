@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""ModelLens proxy tests — stdlib fake upstream, no real gateway, no tokens.
+"""ModelLens proxy tests - stdlib fake upstream, no real gateway, no tokens.
 
 Covers the parts that decide where a user's request goes: ordering per profile,
 capability gating, failover (and when NOT to fail over), sticky sessions,
@@ -36,6 +36,7 @@ class Upstream:
     models: dict = {}
     calls: list = []
     discovery_calls = 0
+    connections = 0
     lock = threading.Lock()
 
     @classmethod
@@ -44,6 +45,7 @@ class Upstream:
             cls.models = models
             cls.calls = []
             cls.discovery_calls = 0
+            cls.connections = 0
 
     @classmethod
     def called_models(cls) -> list:
@@ -53,6 +55,11 @@ class Upstream:
 
 class FakeHandler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
+
+    def setup(self):
+        super().setup()
+        with Upstream.lock:
+            Upstream.connections += 1
 
     def log_message(self, *a):
         pass
@@ -459,7 +466,7 @@ class RoutingE2ETest(ProxyHarness):
         "slow": {"delay": 0.25},
     }
     # tools/json are not measurable by a probe, so a test that sends them must
-    # declare support — exactly what a real deployment has to do.
+    # declare support - exactly what a real deployment has to do.
     endpoint_cfg = {"capabilities": {
         "fast": {"tools": True, "json": True},
         "slow": {"tools": True, "json": True},
@@ -483,7 +490,7 @@ class RoutingE2ETest(ProxyHarness):
         status, headers, _ = self.chat(model="auto:capable")
         self.assertEqual(status, 200)
         # `capable` sorts by score; both are 100% success here, so the faster
-        # median wins on the tie-break — the important part is that it routed.
+        # median wins on the tie-break - the important part is that it routed.
         self.assertIn(self.selected(headers), ("fast", "slow"))
         self.assertEqual(self.header(headers, "X-Modellens-Profile"), "capable")
 
@@ -727,6 +734,185 @@ class StickyE2ETest(ProxyHarness):
         self.assertEqual(self.selected(h2), "a")
         self.assertNotEqual(self.header(h1, "X-Modellens-Reason"), "sticky")
         self.assertNotEqual(self.header(h2, "X-Modellens-Reason"), "sticky")
+
+
+class CostAccountingTest(ProxyHarness):
+    models = {
+        "m": {
+            "meta": {"priced": {"input": 0.5, "output": 1.5}},
+            "body": {"model": "m",
+                     "usage": {"prompt_tokens": 1000, "completion_tokens": 500},
+                     "choices": [{"index": 0, "finish_reason": "stop",
+                                  "message": {"role": "assistant", "content": "ok"}}]},
+        },
+    }
+
+    @staticmethod
+    def history(store):
+        _rows(store, "gw", "m", latency=100.0)
+
+    def test_cost_and_tokens_are_announced_and_recorded(self):
+        status, headers, _ = self.chat(model="auto:capable")
+        self.assertEqual(status, 200)
+        # 1000/1e6*0.5 + 500/1e6*1.5 = 0.0005 + 0.00075
+        self.assertEqual(self.header(headers, "X-Modellens-Tokens"), "1000+500")
+        self.assertEqual(float(self.header(headers, "X-Modellens-Cost-USD")), 0.00125)
+        self.assertTrue(self.wait_for(lambda: len(self.proxy_rows(model="m")) == 1))
+        row = self.proxy_rows(model="m")[0]
+        self.assertEqual(row["prompt_tokens"], 1000)
+        self.assertEqual(row["completion_tokens"], 500)
+        self.assertAlmostEqual(row["cost_usd"], 0.00125, places=8)
+
+    def test_cost_reaches_the_metrics(self):
+        self.chat(model="auto:capable")
+        self.assertTrue(self.wait_for(
+            lambda: self.app.counters["cost_usd"] > 0))
+        _, _, text = self.request({}, path="/modellens/metrics", method="GET")
+        body = text.decode()
+        self.assertIn('modellens_proxy_tokens_total{kind="input"} 1000', body)
+        self.assertIn('modellens_proxy_tokens_total{kind="output"} 500', body)
+        self.assertIn("modellens_proxy_cost_usd_total 0.00125", body)
+        self.assertIn('modellens_proxy_model_cost_usd_total{model="m"} 0.00125', body)
+
+    def test_health_reports_spend(self):
+        self.chat(model="auto:capable")
+        self.assertTrue(self.wait_for(lambda: self.app.counters["cost_usd"] > 0))
+        _, _, data = self.request({}, path="/modellens/health", method="GET")
+        health = json.loads(data)
+        self.assertAlmostEqual(health["counters"]["cost_usd"], 0.00125, places=8)
+
+
+class CostMathTest(unittest.TestCase):
+    def test_pricing_per_million(self):
+        self.assertAlmostEqual(
+            P.compute_cost({"input": 2.0, "output": 8.0},
+                           {"prompt": 1_000_000, "completion": 1_000_000}), 10.0)
+
+    def test_unknown_price_or_usage_is_none_not_a_guess(self):
+        self.assertIsNone(P.compute_cost({"input": None, "output": None},
+                                         {"prompt": 100, "completion": 50}))
+        self.assertIsNone(P.compute_cost({"input": 1.0, "output": 1.0}, None))
+        # Half the numbers known: only the known half is billed, honestly.
+        self.assertAlmostEqual(
+            P.compute_cost({"input": 1.0, "output": None},
+                           {"prompt": 1_000_000, "completion": 999}), 1.0)
+
+    def test_usage_parsing_from_json_and_sse(self):
+        self.assertEqual(P.usage_from_json(
+            json.dumps({"usage": {"prompt_tokens": 3, "completion_tokens": 4}}).encode()),
+            {"prompt": 3, "completion": 4})
+        self.assertIsNone(P.usage_from_json(b"not json"))
+        chunk = (b'data: {"choices":[],"usage":{"prompt_tokens":7,'
+                 b'"completion_tokens":9}}\n\n')
+        self.assertEqual(P.usage_from_sse(chunk), {"prompt": 7, "completion": 9})
+        self.assertIsNone(P.usage_from_sse(b'data: {"choices":[{"delta":{}}]}\n\n'))
+
+
+class StreamCostTest(ProxyHarness):
+    models = {
+        "s": {"meta": {"priced": {"input": 1.0, "output": 2.0}},
+              "chunks": ['{"choices":[{"delta":{"content":"hi"}}]}',
+                         '{"choices":[],"usage":{"prompt_tokens":10,'
+                         '"completion_tokens":5}}']},
+    }
+
+    @staticmethod
+    def history(store):
+        _rows(store, "gw", "s", latency=100.0)
+
+    def test_stream_usage_is_captured_from_the_final_chunk(self):
+        status, _, _ = self.chat(model="auto:capable", stream=True)
+        self.assertEqual(status, 200)
+        self.assertTrue(self.wait_for(lambda: len(self.proxy_rows(model="s")) == 1))
+        row = self.proxy_rows(model="s")[0]
+        # 10/1e6*1.0 + 5/1e6*2.0
+        self.assertAlmostEqual(row["cost_usd"], 0.00002, places=8)
+
+
+class ConnectionPoolTest(ProxyHarness):
+    models = {"m": {"delay": 0.0}}
+
+    @staticmethod
+    def history(store):
+        _rows(store, "gw", "m", latency=100.0)
+
+    def test_two_requests_reuse_one_connection(self):
+        with Upstream.lock:            # discovery at startup also opens one
+            Upstream.connections = 0
+        self.chat(model="auto:capable")
+        self.chat(model="auto:capable", messages=[{"role": "user", "content": "x"}])
+        self.assertEqual(Upstream.connections, 1)      # one TCP connection
+        self.assertGreaterEqual(self.app.pool.hits, 1)
+
+    def test_pool_is_bounded_and_expires(self):
+        pool = P.ConnPool(max_idle=1, idle_ttl_s=0.01)
+
+        class FakeConn:
+            def __init__(self):
+                self.closed = False
+
+            def close(self):
+                self.closed = True
+
+        pool.release("e", FakeConn())
+        pool.release("e", FakeConn())       # over max_idle: closed immediately
+        self.assertEqual(len(pool._idle["e"]), 1)
+        time.sleep(0.02)
+        pool._idle["e"][0] = (pool._idle["e"][0][0], time.monotonic() - 1)
+        ep = M.Endpoint({"name": "e", "base_url": "http://127.0.0.1:1/v1"})
+        conn, reused = pool.acquire(ep, timeout=1)
+        self.assertFalse(reused)            # stale idle connection was dropped
+        conn.close()
+
+    def test_stale_keepalive_errors_are_classified(self):
+        import http.client as hc
+        self.assertTrue(P._stale_connection_error(hc.RemoteDisconnected("x")))
+        self.assertTrue(P._stale_connection_error(ConnectionResetError()))
+        self.assertFalse(P._stale_connection_error(ValueError("nope")))
+
+
+class ProberToolsTest(ProxyHarness):
+    models = {"tooly": {
+        "body": {"model": "tooly",
+                 "choices": [{"index": 0, "finish_reason": "stop",
+                              "message": {"role": "assistant", "content": "",
+                                          "tool_calls": [
+                                              {"id": "c1", "type": "function",
+                                               "function": {"name": "modellens_ping",
+                                                            "arguments": "{}"}}]}}]},
+    }}
+    proxy_cfg = {"probe": {"enabled": True, "interval_s": 3600, "limit": 3,
+                           "check_tools": True, "check_stream": False}}
+
+    @staticmethod
+    def history(store):
+        # Evidence without tools_ok: capability is unknown, so a tool-using
+        # request would be gated until the prober measures it.
+        _rows(store, "gw", "tooly", latency=100.0)
+
+    def test_probe_learns_tool_support(self):
+        before = self.app.table().by_id("gw/tooly")
+        self.assertIsNone(before.caps["tools"])
+
+        rows = self.app.prober.probe_once()
+        self.assertEqual(len(rows), 1)
+        self.assertIs(rows[0]["tools_ok"], True)
+
+        self.app.rebuild_table()
+        after = self.app.table().by_id("gw/tooly")
+        self.assertIs(after.caps["tools"], True)
+
+    def test_tool_request_routes_once_capability_is_known(self):
+        # Unknown tools => gated out before the prober runs.
+        status, _, _ = self.chat(tools=[{"type": "function",
+                                         "function": {"name": "f"}}])
+        self.assertEqual(status, 503)
+        self.app.prober.probe_once()
+        self.app.rebuild_table()
+        status, headers, _ = self.chat(tools=[{"type": "function",
+                                              "function": {"name": "f"}}])
+        self.assertEqual(status, 200)
+        self.assertEqual(self.selected(headers), "tooly")
 
 
 if __name__ == "__main__":
