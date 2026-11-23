@@ -187,6 +187,7 @@ class Cand:
     caps: dict
     probe_rows: int
     proxy_rows: int
+    p95_ms: float | None = None     # None until >= 20 latency samples
 
     @property
     def id(self) -> str:
@@ -263,11 +264,27 @@ class Discovery:
             self._cache.clear()
 
 
+P95_TAIL_WEIGHT = 0.5   # how much of the p95-over-median tail counts as latency
+
+
+def _balanced_latency_ms(c: Cand) -> float:
+    """Median latency, pushed up by the tail when p95 is known.
+
+    Two models with a 2 s median are not equal if one has a 12 s p95: users
+    feel the tail. Without enough samples for p95 (None), the median stands
+    alone - no evidence is not a penalty.
+    """
+    med = c.median_ms or 1000.0
+    if c.p95_ms is not None and c.p95_ms > med:
+        med += P95_TAIL_WEIGHT * (c.p95_ms - med)
+    return max(1.0, med)
+
+
 def _order_balanced(candidates: list[Cand]) -> list[Cand]:
-    # Score per second of median latency: a 90-score model at 2 s beats a
-    # 95-score model at 10 s for interactive use.
+    # Score per second of tail-adjusted latency: a 90-score model at 2 s beats
+    # a 95-score model at 10 s, and a steady 2 s beats a spiky 2 s.
     return sorted(candidates,
-                  key=lambda c: (-(c.score / max(1.0, c.median_ms or 1000.0)), c.id))
+                  key=lambda c: (-(c.score / _balanced_latency_ms(c)), c.id))
 
 
 def build_table(ctx, cfg: ProxyConfig, discovery: Discovery,
@@ -296,6 +313,7 @@ def build_table(ctx, cfg: ProxyConfig, discovery: Discovery,
                 caps=resolve_caps(rows, info, overrides),
                 probe_rows=len([r for r in rows if r.get("source") != "proxy"]),
                 proxy_rows=len([r for r in rows if r.get("source") == "proxy"]),
+                p95_ms=stats.get("p95_latency_ms"),
             )
             if stats["verdict"] not in ROUTABLE_VERDICTS:
                 skipped.append({"id": cand.id, "verdict": cand.verdict,
@@ -305,7 +323,7 @@ def build_table(ctx, cfg: ProxyConfig, discovery: Discovery,
 
     ordered: dict[str, list[Cand]] = {"balanced": _order_balanced(candidates)}
     degraded: dict[str, bool] = {"balanced": False}
-    notes: dict[str, str | None] = {"balanced": "score per second of median latency"}
+    notes: dict[str, str | None] = {"balanced": "score per second of median latency, penalised by p95 tail"}
     for profile in ("fast", "cheap", "capable"):
         rows = [c.as_row() for c in candidates]
         ordered_rows, note = ml.order_for_profile(rows, profile)

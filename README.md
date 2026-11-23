@@ -235,7 +235,7 @@ clients keep working, and only `auto*` requests are routed.
 | `auto:fast` | lowest median latency among models ≥90% success |
 | `auto:capable` | highest quality score |
 | `auto:cheap` | zero-priced models when the endpoint advertises pricing |
-| `auto:balanced` | score per second of latency |
+| `auto:balanced` | score per second of latency; with ≥20 samples the p95 tail counts too (median + 0.5 × (p95 − median)), so a steady model beats a spiky one |
 
 Every response says what happened, so a routing decision is never a mystery:
 

@@ -284,6 +284,38 @@ class OrderingTest(unittest.TestCase):
         self.assertEqual(rec["picks"][0]["id"], "gw/fast")
 
 
+class BalancedTailTest(unittest.TestCase):
+    def _cand(self, model, score=80.0, median=2000.0, p95=None):
+        return P.Cand(endpoint="gw", model=model, score=score, verdict="healthy",
+                      success_rate=100.0, median_ms=median, ttft_ms=None,
+                      attempts=30, age_hours=0.1, pricing={}, caps={},
+                      probe_rows=30, proxy_rows=0, p95_ms=p95)
+
+    def test_steady_beats_spiky_at_same_median(self):
+        spiky = self._cand("a-spiky", p95=12000.0)
+        steady = self._cand("b-steady", p95=2500.0)
+        ordered = P._order_balanced([spiky, steady])
+        self.assertEqual([c.model for c in ordered], ["b-steady", "a-spiky"])
+
+    def test_unknown_p95_is_not_penalised(self):
+        c = self._cand("m", p95=None)
+        self.assertEqual(P._balanced_latency_ms(c), 2000.0)
+
+    def test_p95_below_median_is_ignored(self):
+        c = self._cand("m", p95=1500.0)
+        self.assertEqual(P._balanced_latency_ms(c), 2000.0)
+
+    def test_tail_weight_applied(self):
+        c = self._cand("m", p95=6000.0)
+        self.assertEqual(P._balanced_latency_ms(c),
+                         2000.0 + P.P95_TAIL_WEIGHT * 4000.0)
+
+    def test_fast_median_still_wins_over_big_score_gap(self):
+        quick = self._cand("quick", score=90.0, median=2000.0, p95=3000.0)
+        slow = self._cand("slow", score=95.0, median=10000.0)
+        self.assertEqual(P._order_balanced([slow, quick])[0].model, "quick")
+
+
 class GatingTest(unittest.TestCase):
     def _cand(self, **over):
         base = dict(endpoint="gw", model="m", score=80.0, verdict="healthy",

@@ -1,5 +1,13 @@
 # Changelog
 
+## Unreleased
+
+### Changed
+- **modellens-proxy**: `auto:balanced` now penalises latency tails. Once a
+  model has ≥20 latency samples, its effective latency is
+  `median + 0.5 × (p95 − median)` (`P95_TAIL_WEIGHT`), so at equal medians a
+  steady model outranks a spiky one. Without a p95 the median stands alone.
+
 ## 0.2.0 - 2026-11-23
 
 ### Added
