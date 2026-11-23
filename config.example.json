@@ -3,5 +3,14 @@
     {"name": "local", "base_url": "http://127.0.0.1:3425/v1", "api_key": ""},
     {"name": "openai", "base_url": "https://api.openai.com/v1", "api_key": "sk-..."},
     {"name": "ollama", "base_url": "http://127.0.0.1:11434/v1"}
-  ]
+  ],
+  "proxy": {
+    "listen": "127.0.0.1:8766",
+    "profile": "capable",
+    "max_attempts": 3,
+    "probe": {"enabled": false, "interval_s": 900, "check_tools": true},
+    "pool": {"max_idle": 8, "idle_s": 60},
+    "breaker": {"fail_threshold": 3, "open_s": 30},
+    "budget": {"max_cost_usd": 0.05, "default_max_tokens": 1024, "allow_unpriced": true}
+  }
 }
