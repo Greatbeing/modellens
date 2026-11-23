@@ -29,6 +29,7 @@ import argparse
 import fnmatch
 import hashlib
 import http.client
+import dataclasses
 import json
 import os
 import queue
@@ -106,6 +107,10 @@ class ProxyConfig:
         pool = raw.get("pool") or {}
         self.pool_max_idle = max(0, int(pool.get("max_idle", 8)))
         self.pool_idle_s = float(pool.get("idle_s", 60))
+        budget = raw.get("budget") or {}
+        self.max_cost_usd = parse_budget(budget.get("max_cost_usd"))
+        self.budget_default_out = max(1, int(budget.get("default_max_tokens", 1024)))
+        self.budget_allow_unpriced = bool(budget.get("allow_unpriced", False))
         breaker = raw.get("breaker") or {}
         self.breaker_threshold = max(1, int(breaker.get("fail_threshold", 3)))
         self.breaker_open_s = float(breaker.get("open_s", 30))
@@ -330,6 +335,8 @@ class Need:
     json_mode: bool = False
     vision: bool = False
     ctx: int = 0
+    max_out: int = 0                 # client's max_tokens, 0 = unknown
+    budget_usd: float | None = None  # per-request cost ceiling, None = none
 
 
 def estimate_tokens(body: dict) -> int:
@@ -357,9 +364,39 @@ def need_from_body(body: dict) -> Need:
                 if isinstance(part, dict) and str(part.get("type", "")).lower() in (
                         "image_url", "input_image", "image"):
                     vision = True
+    max_out = 0
+    for key in ("max_completion_tokens", "max_tokens"):
+        val = body.get(key)
+        if isinstance(val, int) and not isinstance(val, bool) and val > 0:
+            max_out = val
+            break
     return Need(stream=bool(body.get("stream")), tools=tools,
                 json_mode="response_format" in body, vision=vision,
-                ctx=estimate_tokens(body))
+                ctx=estimate_tokens(body), max_out=max_out)
+
+
+def parse_budget(val) -> float | None:
+    """A positive finite USD amount, or None (no ceiling / unparseable)."""
+    try:
+        f = float(val)
+    except (TypeError, ValueError):
+        return None
+    return f if f > 0 and f != float("inf") else None
+
+
+def estimate_cost(cand: "Cand", need: Need, default_out: int) -> float | None:
+    """Worst-case USD for this request on this candidate; None if unpriced.
+
+    Input is the context estimate; output is the client's max_tokens, or
+    `default_out` when the client did not bound it. Both prices are required:
+    a half-priced estimate would understate the real ceiling.
+    """
+    p_in = (cand.pricing or {}).get("input")
+    p_out = (cand.pricing or {}).get("output")
+    if not isinstance(p_in, (int, float)) or not isinstance(p_out, (int, float)):
+        return None
+    out = need.max_out or default_out
+    return (need.ctx * float(p_in) + out * float(p_out)) / 1_000_000.0
 
 
 def resolve_profile(model_field, header_profile, default: str) -> tuple[str, str | None]:
@@ -399,6 +436,13 @@ def gate_reason(cand: Cand, need: Need, cfg: ProxyConfig) -> str | None:
     ctx = cand.caps.get("ctx")
     if need.ctx and isinstance(ctx, int) and ctx > 0 and need.ctx > ctx:
         return "context_too_small"
+    if need.budget_usd is not None:
+        est = estimate_cost(cand, need, cfg.budget_default_out)
+        if est is None:
+            if not cfg.budget_allow_unpriced:
+                return "unpriced"
+        elif est > need.budget_usd:
+            return "over_budget"
     if not _allowed(cand.model, cfg):
         return "denied"
     return None
@@ -1192,6 +1236,8 @@ class Handler(BaseHTTPRequestHandler):
 
         self.app.bump("requests")
         need = need_from_body(body)
+        need = dataclasses.replace(
+            need, budget_usd=self._budget(self.headers.get("X-Modellens-Max-Cost")))
         profile, pinned = resolve_profile(body.get("model"),
                                           self.headers.get("X-Modellens-Profile"),
                                           self.app.cfg.profile)
@@ -1240,6 +1286,14 @@ class Handler(BaseHTTPRequestHandler):
         if len(matches) > 1:      # same model on several endpoints: healthiest
             return max(matches, key=lambda c: (c.score, -(c.median_ms or 1e12)))
         return matches[0]
+
+    def _budget(self, header_val) -> float | None:
+        """Header may tighten the configured ceiling, never loosen it."""
+        cap = self.app.cfg.max_cost_usd
+        asked = parse_budget(header_val)
+        if asked is None:
+            return cap
+        return asked if cap is None else min(asked, cap)
 
     @staticmethod
     def _truthy(val) -> bool:
@@ -1479,6 +1533,8 @@ class Handler(BaseHTTPRequestHandler):
                        "messages": [{"role": "user",
                                      "content": (q.get("prompt") or ["hi"])[0]}]}
         need = need_from_body(payload)
+        need = dataclasses.replace(need, budget_usd=self._budget(
+            self.headers.get("X-Modellens-Max-Cost") or (q.get("max_cost") or [None])[0]))
         profile, pinned = resolve_profile(payload.get("model"),
                                           (q.get("profile") or [None])[0],
                                           self.app.cfg.profile)

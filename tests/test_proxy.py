@@ -782,6 +782,78 @@ class CostAccountingTest(ProxyHarness):
         self.assertAlmostEqual(health["counters"]["cost_usd"], 0.00125, places=8)
 
 
+class BudgetGateTest(unittest.TestCase):
+    def _cand(self, pricing):
+        return P.Cand(endpoint="gw", model="m", score=80.0, verdict="healthy",
+                      success_rate=100.0, median_ms=100.0, ttft_ms=None,
+                      attempts=5, age_hours=0.1, pricing=pricing, probe_rows=5,
+                      proxy_rows=0, caps={})
+
+    def test_estimate_uses_max_tokens_or_default(self):
+        c = self._cand({"input": 1.0, "output": 2.0})
+        self.assertAlmostEqual(P.estimate_cost(c, P.Need(ctx=1000), 500),
+                               (1000 * 1.0 + 500 * 2.0) / 1e6)
+        self.assertAlmostEqual(P.estimate_cost(c, P.Need(ctx=1000, max_out=10), 500),
+                               (1000 * 1.0 + 10 * 2.0) / 1e6)
+        self.assertIsNone(P.estimate_cost(self._cand({"input": 1.0}), P.Need(), 1))
+
+    def test_over_budget_and_unpriced_are_blocked(self):
+        cfg = P.ProxyConfig({})
+        need = P.Need(ctx=1000, max_out=1000, budget_usd=0.001)
+        self.assertEqual(P.gate_reason(self._cand({"input": 1.0, "output": 1.0}),
+                                       need, cfg), "over_budget")
+        self.assertIsNone(P.gate_reason(self._cand({"input": 0.1, "output": 0.1}),
+                                        need, cfg))
+        self.assertEqual(P.gate_reason(self._cand({}), need, cfg), "unpriced")
+        self.assertIsNone(P.gate_reason(
+            self._cand({}), need, P.ProxyConfig({"budget": {"allow_unpriced": True}})))
+        # no ceiling = no budget gate at all
+        self.assertIsNone(P.gate_reason(self._cand({}), P.Need(), cfg))
+
+    def test_parse_budget(self):
+        for bad in (None, "", "x", "0", "-1", "inf", "nan"):
+            self.assertIsNone(P.parse_budget(bad), bad)
+        self.assertEqual(P.parse_budget("0.5"), 0.5)
+
+
+class BudgetE2ETest(ProxyHarness):
+    models = CostAccountingTest.models
+    proxy_cfg = {"budget": {"max_cost_usd": 0.01}}
+
+    @staticmethod
+    def history(store):
+        _rows(store, "gw", "m", latency=100.0)
+
+    def test_within_budget_routes(self):
+        status, _, _ = self.chat(model="auto:capable")
+        self.assertEqual(status, 200)
+
+    def test_header_tightens_and_503_names_the_reason(self):
+        # "hi" ~ 256 in + 1024 default out -> ~0.00166 USD > 0.001
+        status, _, data = self.request(
+            {"model": "auto", "messages": [{"role": "user", "content": "hi"}]},
+            headers={"X-Modellens-Max-Cost": "0.001"})
+        self.assertEqual(status, 503)
+        self.assertIn("over_budget", data.decode())
+        self.assertEqual(Upstream.calls.get("m", 0) if isinstance(
+            getattr(Upstream, "calls", None), dict) else 0, 0)
+
+    def test_max_tokens_brings_it_under_budget(self):
+        status, _, _ = self.request(
+            {"model": "auto", "max_tokens": 100,
+             "messages": [{"role": "user", "content": "hi"}]},
+            headers={"X-Modellens-Max-Cost": "0.001"})
+        self.assertEqual(status, 200)
+
+    def test_header_cannot_loosen_config_cap(self):
+        status, _, data = self.request(
+            {"model": "auto", "max_tokens": 100000,
+             "messages": [{"role": "user", "content": "hi"}]},
+            headers={"X-Modellens-Max-Cost": "100"})
+        self.assertEqual(status, 503)
+        self.assertIn("over_budget", data.decode())
+
+
 class CostMathTest(unittest.TestCase):
     def test_pricing_per_million(self):
         self.assertAlmostEqual(

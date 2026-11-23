@@ -408,3 +408,16 @@ committed (and any value previously committed must be rotated).
 - Hosted landing page: [`LANDING_EN.md`](LANDING_EN.md)
 - MCP server listing (MCPize): [`MCPIZE_SUBMISSION.md`](MCPIZE_SUBMISSION.md)
 - x402 buyer guide: [`X402_BUYER_GUIDE.md`](X402_BUYER_GUIDE.md)
+### Per-request cost ceiling
+
+```json
+"proxy": { "budget": { "max_cost_usd": 0.05, "default_max_tokens": 1024, "allow_unpriced": false } }
+```
+
+Before forwarding, each candidate's worst-case cost is estimated as
+`ctx_estimate x input_price + max_tokens x output_price` (per-million pricing; `default_max_tokens`
+when the client sent no `max_tokens`). Candidates above the ceiling are skipped with `over_budget`;
+candidates without both prices are skipped with `unpriced` unless `allow_unpriced` is set.
+Clients can tighten (never loosen) the ceiling per request with `X-Modellens-Max-Cost: 0.002`;
+`/modellens/explain?max_cost=...` shows the effect without calling upstream. No ceiling configured
+and no header = no budget gate.
