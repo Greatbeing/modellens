@@ -716,10 +716,13 @@ class Store:
         bucket permanently in reverse and every later trim evicted the middle
         of the history — 10 rows with keep=2 collapsed to [newest, oldest].
         """
-        keep_idx: dict[str, list[int]] = {}
+        keep_idx: dict[tuple, list[int]] = {}
         for idx in range(len(self.rows) - 1, -1, -1):
             row = self.rows[idx]
-            key = f"{row.get('endpoint')}/{row.get('model')}"
+            # A tuple, not "endpoint/model": an OpenRouter-style id
+            # ("openai/gpt-4o") encodes exactly like endpoint "openai" + model
+            # "gpt-4o", so a string key would trim two models as one.
+            key = (row.get("endpoint"), row.get("model"))
             bucket = keep_idx.setdefault(key, [])
             if len(bucket) < self.keep:
                 bucket.append(idx)
@@ -862,15 +865,20 @@ def build_ranking(store: Store, endpoints: list[Endpoint], now: float | None = N
     store.refresh()  # rankings must include rows another process wrote meanwhile
     if now is None:
         now = time.time()
-    models: dict[str, dict] = {}
+    # Keyed by the (endpoint, model) TUPLE: "endpoint/model" is ambiguous once
+    # a model id contains a slash (openrouter "openai/gpt-4o" vs endpoint
+    # "openai" + model "gpt-4o" would collide and one model would vanish).
+    models: dict[tuple, dict] = {}
     for ep in endpoints:
         if not ep.enabled:
             continue
         for info in discover_models_detailed(ep):
             mid = info["id"]
-            key = f"{ep.name}/{mid}"
-            models[key] = {"endpoint": ep.name, "model": mid, "id": key,
-                           "pricing": info["pricing"]}
+            models[(ep.name, mid)] = {
+                "endpoint": ep.name, "model": mid,
+                "id": f"{ep.name}/{mid}",   # display label, never a key
+                "pricing": info["pricing"],
+            }
     out = []
     for key, info in models.items():
         stats = score_model(store.for_model(info["endpoint"], info["model"]), now=now)

@@ -181,6 +181,16 @@ class StoreTest(unittest.TestCase):
         self.assertEqual([r["n"] for r in st.for_model("e", "noisy")], [3, 4])
         self.assertEqual([r["n"] for r in st.for_model("e", "quiet")], [3, 4])
 
+    def test_trim_keys_on_the_pair_not_a_joined_string(self):
+        # A tuple key cannot conflate the sentinel a joined string invents:
+        # f"{endpoint}/{model}" renders a missing endpoint as "None", which is
+        # the same key as an endpoint actually named "None".
+        st = M.Store("", keep=1)
+        st.add([{"model": "m", "ok": True, "n": 1},                 # no endpoint
+                {"endpoint": "None", "model": "m", "ok": True, "n": 2}])
+        self.assertEqual(len(st.rows), 2)
+        self.assertEqual(sorted(r["n"] for r in st.rows), [1, 2])
+
     def test_save_load_roundtrip(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = os.path.join(tmp, "sub", "history.json")

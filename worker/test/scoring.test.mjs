@@ -90,6 +90,30 @@ test('the same model on two endpoints is two rows (not merged)', () => {
   assert.equal(bad.score, 0);
 });
 
+test('an endpoint literally named "default" is not merged with no endpoint', () => {
+  // The old `${endpoint || 'default'}/${model}` key collapsed these two.
+  const agg = aggregate([
+    { ...row(true, 200, 100), endpoint: 'default' },
+    { ...row(true, 200, 500), endpoint: undefined },
+  ]);
+  assert.equal(agg.length, 2);
+  assert.deepEqual(agg.map((r) => r.attempts).sort(), [1, 1]);
+});
+
+test('junk rows do not take the whole ranking down', () => {
+  // KV is written by an ingest endpoint; a null/hand-edited entry must not 500.
+  const agg = aggregate([null, undefined, 42, 'x', {}, { model: '' },
+                         { ...row(true, 200, 100), endpoint: 'a' }]);
+  assert.equal(agg.length, 1);
+  assert.equal(agg[0].model, 'm');
+});
+
+test('integer-looking model ids keep a stable order', () => {
+  const agg = aggregate([{ ...row(true, 200, 100), model: '10' },
+                         { ...row(true, 200, 100), model: '2' }]);
+  assert.deepEqual(agg.map((r) => r.model).sort(), ['10', '2']); // not object-key order
+});
+
 test('auth errors get their own verdict', () => {
   const s = scoreModel([row(false, 401), row(false, 403)]);
   assert.equal(s.verdict, 'auth_error');

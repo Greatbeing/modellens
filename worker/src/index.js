@@ -280,20 +280,36 @@ function aggregate(rows, nowMs) {
   // Group by endpoint AND model: the same model id (gpt-4o-mini) served by two
   // gateways is two different qualities — merging them would misrank both and
   // diverge from the Python core, which keys history on (endpoint, model).
-  const byModel = {};
+  //
+  // Nested Maps, not a `${endpoint}/${model}` string: a string key cannot tell
+  // endpoint "default" + model "m" from a row with no endpoint, and an
+  // OpenRouter-style id ("openai/gpt-4o") encodes exactly like endpoint
+  // "openai" + model "gpt-4o" once the sentinel prefix is dropped.
+  const byEndpoint = new Map();
   for (const r of rows || []) {
-    if (!r.model) continue;
-    const key = `${r.endpoint || 'default'}/${r.model}`;
-    (byModel[key] = byModel[key] || []).push(r);
+    // KV is written by an ingest endpoint and hand-edited files exist: a null
+    // or scalar entry must not take the whole ranking down.
+    if (!r || typeof r !== 'object' || !r.model) continue;
+    const ep = r.endpoint || '';
+    let models = byEndpoint.get(ep);
+    if (!models) {
+      models = new Map();
+      byEndpoint.set(ep, models);
+    }
+    const bucket = models.get(r.model);
+    if (bucket) bucket.push(r);
+    else models.set(r.model, [r]);
   }
   const out = [];
-  for (const [key, rs] of Object.entries(byModel)) {
-    out.push({
-      id: key,
-      endpoint: (rs[0] && rs[0].endpoint) || 'default',
-      model: (rs[0] && rs[0].model) || key,
-      ...scoreModel(rs, nowMs),
-    });
+  for (const [ep, models] of byEndpoint) {
+    for (const [model, rs] of models) {
+      out.push({
+        id: `${ep || 'default'}/${model}`,   // display label, never a key
+        endpoint: ep || 'default',
+        model,
+        ...scoreModel(rs, nowMs),
+      });
+    }
   }
   out.sort((a, b) => b.score - a.score
     || (a.median_latency_ms ?? 1e12) - (b.median_latency_ms ?? 1e12)
