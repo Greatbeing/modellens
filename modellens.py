@@ -28,6 +28,8 @@ from __future__ import annotations
 
 import argparse
 import calendar
+import contextlib
+import hashlib
 import json
 import math
 import os
@@ -493,12 +495,22 @@ def probe_tools(ep: Endpoint, model: str) -> bool | None:
 # --------------------------------------------------------------------------
 
 class Store:
-    """Append-only JSON store of probe results, bounded to the last N per model.
+    """JSON store of probe results, bounded to the last N rows per model.
 
-    Thread-safe: the hosted x402 server shares one Store across the request
-    threads of a ThreadingHTTPServer, so add/save/for_model take a lock, and
-    save() writes through a UNIQUE temp file (a fixed ".tmp" name races two
-    concurrent saves: one os.replace() moves a half-written or deleted file).
+    Safe with several threads AND several processes writing the same file (the
+    MCP server, the CLI batch, and the hosted x402 server all open one):
+
+    * an RLock for threads, plus an advisory file lock for processes — the
+      read-modify-write in append() would otherwise lose a whole probe batch
+      when two writers interleave (each reloads, each extends, last one wins);
+    * change detection by CONTENT HASH, not mtime: a restored backup, `rsync -t`
+      or a coarse filesystem can leave mtime equal or older, and `mtime >` then
+      never notices a foreign write;
+    * a UNIQUE temp file + fsync + os.replace (a fixed ".tmp" name races two
+      concurrent saves: one moves a half-written or already-moved file);
+    * on Windows os.replace raises PermissionError while ANY other process holds
+      the file open, so the rename retries for ~1 s;
+    * a corrupt file is copied aside instead of being overwritten.
     """
 
     def __init__(self, path: str, keep: int = 200):
@@ -506,25 +518,194 @@ class Store:
         self.keep = keep
         self.rows: list[dict] = []
         self._lock = threading.RLock()
+        self._hash: str | None = None   # sha256 of the bytes we last read/wrote
+        self._unsaved: list[dict] = []  # added since the last successful write
         self._load()
 
-    def _load(self) -> None:
-        if not self.path or not os.path.exists(self.path):
+    # -- reading ---------------------------------------------------------
+    def _read_bytes(self) -> bytes | None:
+        if not self.path:
+            return None
+        try:
+            with open(self.path, "rb") as fh:
+                return fh.read()
+        except FileNotFoundError:
+            return None
+        except OSError:
+            return None
+
+    def _load_from(self, raw: bytes | None) -> None:
+        if not raw:
+            self.rows, self._hash = [], None
             return
         try:
-            with open(self.path, encoding="utf-8") as fh:
-                data = json.load(fh)
-            if isinstance(data, dict):
-                self.rows = list(data.get("rows") or [])
-            elif isinstance(data, list):
-                self.rows = data
+            data = json.loads(raw.decode("utf-8"))
+            rows = data.get("rows") if isinstance(data, dict) else data
+            self.rows = list(rows or []) if isinstance(rows, (list, type(None))) else []
         except Exception:
+            self._keep_corrupt(raw)
             self.rows = []
+        self._hash = hashlib.sha256(raw).hexdigest()
 
+    def _keep_corrupt(self, raw: bytes) -> None:
+        """Copy an unreadable history aside so a later save cannot destroy it."""
+        if not self.path:
+            return
+        target = f"{self.path}.corrupt-{int(time.time())}"
+        try:
+            with open(target, "xb") as fh:
+                fh.write(raw)
+            sys.stderr.write(f"modellens: unreadable history; kept a copy at {target}\n")
+        except OSError:
+            pass
+
+    def _load(self) -> None:
+        self._load_from(self._read_bytes())
+
+    def _reload_if_changed(self) -> bool:
+        raw = self._read_bytes()
+        if raw is None:
+            return False
+        if hashlib.sha256(raw).hexdigest() == self._hash:
+            return False
+        self._load_from(raw)
+        return True
+
+    # -- cross-process lock ----------------------------------------------
+    @contextlib.contextmanager
+    def _file_lock(self):
+        if not self.path:
+            yield
+            return
+        lock_path = self.path + ".lock"
+        os.makedirs(os.path.dirname(os.path.abspath(lock_path)), exist_ok=True)
+        fh = open(lock_path, "a+b")
+        try:
+            if fh.tell() == 0:          # msvcrt needs a byte to lock
+                fh.write(b"\0")
+                fh.flush()
+            fh.seek(0)
+            if os.name == "nt":
+                import msvcrt
+                # LK_LOCK retries once per SECOND on Windows, so a contended
+                # save stalls in 1 s steps. Poll with LK_NBLCK instead.
+                deadline = time.monotonic() + 30.0
+                while True:
+                    try:
+                        fh.seek(0)
+                        msvcrt.locking(fh.fileno(), msvcrt.LK_NBLCK, 1)
+                        break
+                    except OSError:
+                        if time.monotonic() > deadline:
+                            raise
+                        time.sleep(0.005)
+            else:
+                import fcntl
+                fcntl.flock(fh.fileno(), fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                if os.name == "nt":
+                    import msvcrt
+                    fh.seek(0)
+                    msvcrt.locking(fh.fileno(), msvcrt.LK_UNLCK, 1)
+                else:
+                    import fcntl
+                    fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+        finally:
+            fh.close()
+
+    # -- writing ---------------------------------------------------------
+    def _payload(self) -> bytes:
+        return json.dumps({"version": 1, "rows": self.rows},
+                          ensure_ascii=False).encode("utf-8")
+
+    def _write(self, payload: bytes) -> None:
+        d = os.path.dirname(os.path.abspath(self.path))
+        os.makedirs(d, exist_ok=True)
+        fd, tmp = tempfile.mkstemp(prefix=".modellens-", suffix=".tmp", dir=d)
+        try:
+            with os.fdopen(fd, "wb") as fh:
+                fh.write(payload)
+                fh.flush()
+                os.fsync(fh.fileno())
+            self._replace(tmp, self.path)
+        except BaseException:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            raise
+        if os.name != "nt":             # make the rename itself durable
+            try:
+                dfd = os.open(d, os.O_RDONLY)
+                try:
+                    os.fsync(dfd)
+                finally:
+                    os.close(dfd)
+            except OSError:
+                pass
+
+    @staticmethod
+    def _replace(tmp: str, path: str, attempts: int = 100) -> None:
+        """os.replace with a ~1 s retry.
+
+        On POSIX the rename is atomic and never fails this way. On Windows it
+        raises PermissionError while any process holds a handle on the target
+        (readers do not share delete), and an antivirus/indexer can hold it for
+        a few milliseconds, so retry instead of failing the whole probe batch.
+        """
+        last = None
+        for i in range(attempts):
+            try:
+                os.replace(tmp, path)
+                return
+            except PermissionError as exc:
+                last = exc
+                if i == attempts - 1:
+                    break
+                time.sleep(0.01)
+        raise last if last else OSError(f"could not replace {path}")
+
+    # -- public API ------------------------------------------------------
     def add(self, rows: list[dict]) -> None:
+        """Buffer rows in memory (call save() to persist)."""
         with self._lock:
             self.rows.extend(rows)
+            self._unsaved.extend(rows)
             self._trim()
+
+    def save(self) -> None:
+        """Persist buffer + anything a concurrent writer added meanwhile."""
+        if not self.path:
+            self._unsaved = []
+            return
+        with self._lock, self._file_lock():
+            if self._reload_if_changed():
+                # Someone else wrote while we held unsaved rows: merge instead
+                # of clobbering. Their rows are in self.rows, ours are re-applied.
+                self.rows.extend(self._unsaved)
+                self._trim()
+            payload = self._payload()
+            self._write(payload)
+            self._hash = hashlib.sha256(payload).hexdigest()
+            self._unsaved = []
+
+    def append(self, rows: list[dict]) -> None:
+        """add + save as one atomic operation (use this from request threads)."""
+        self.add(rows)
+        self.save()
+
+    def refresh(self) -> bool:
+        """Pick up rows another process wrote (CLI batch, hosted server, ingest).
+
+        A long-running server keeps its rows in memory; without this it would
+        only ever see its own writes. Returns True when the file had changed.
+        """
+        if not self.path:
+            return False
+        with self._lock:
+            return self._reload_if_changed()
 
     def _trim(self) -> None:
         """Keep the newest `keep` rows per (endpoint, model), preserving order.
@@ -546,46 +727,8 @@ class Store:
         if len(kept) != len(self.rows):
             self.rows = [r for i, r in enumerate(self.rows) if i in kept]
 
-    def save(self) -> None:
-        if not self.path:
-            return
-        with self._lock:
-            d = os.path.dirname(os.path.abspath(self.path))
-            os.makedirs(d, exist_ok=True)
-            fd, tmp = tempfile.mkstemp(prefix=".modellens-", suffix=".tmp", dir=d)
-            try:
-                with os.fdopen(fd, "w", encoding="utf-8") as fh:
-                    json.dump({"version": 1, "rows": self.rows}, fh, ensure_ascii=False)
-                self._replace(tmp, self.path)
-            except Exception:
-                try:
-                    os.unlink(tmp)
-                except OSError:
-                    pass
-                raise
-
-    @staticmethod
-    def _replace(tmp: str, path: str, attempts: int = 20) -> None:
-        """os.replace with a short retry.
-
-        On POSIX the rename is atomic and never fails this way. On Windows,
-        replacing a file another thread is mid-read of raises PermissionError
-        (open handles do not allow delete-sharing), and an antivirus/indexer
-        can hold the file for a few milliseconds. Retrying converges because
-        both readers and the writer are this same process.
-        """
-        last = None
-        for _ in range(attempts):
-            try:
-                os.replace(tmp, path)
-                return
-            except PermissionError as exc:  # Windows-only race; benign
-                last = exc
-                time.sleep(0.01)
-        raise last if last else OSError(f"could not replace {path}")
-
     def for_model(self, endpoint: str, model: str) -> list[dict]:
-        with self._lock:
+        with self._lock:               # snapshot: callers must not mutate state
             return [r for r in self.rows
                     if r.get("endpoint") == endpoint and r.get("model") == model]
 
@@ -716,6 +859,7 @@ def score_model(rows: list[dict], now: float | None = None) -> dict:
 
 
 def build_ranking(store: Store, endpoints: list[Endpoint], now: float | None = None) -> list[dict]:
+    store.refresh()  # rankings must include rows another process wrote meanwhile
     if now is None:
         now = time.time()
     models: dict[str, dict] = {}
@@ -895,8 +1039,10 @@ def tool_probe(ctx: Context, args: dict) -> str:
     else:
         results = [_probe_one(ep, m, check_tools, check_stream) for ep, m in targets]
 
-    ctx.store.add(results)
-    ctx.store.save()
+    # One atomic append: merge what other processes wrote meanwhile, add these
+    # rows, and persist. add()+save() as two calls would leave a window where a
+    # concurrent writer's batch can be clobbered.
+    ctx.store.append(results)
 
     ok = sum(1 for r in results if r["ok"])
     lines = [f"Probed {len(results)} models: {ok} ok, {len(results) - ok} failed.", ""]

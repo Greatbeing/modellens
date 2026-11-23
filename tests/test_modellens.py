@@ -594,6 +594,114 @@ class ProtocolRobustnessTest(unittest.TestCase):
         self.assertIn("result", r)
 
 
+class StoreMultiWriterTest(unittest.TestCase):
+    """The CLI, the MCP server and the hosted x402 server share one history file."""
+
+    def test_two_instances_do_not_lose_each_others_rows(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "h.json")
+            a, b = M.Store(path), M.Store(path)
+            a.add([{"endpoint": "e", "model": "a", "ok": True}])
+            a.save()
+            b.add([{"endpoint": "e", "model": "b", "ok": True}])
+            b.save()                       # reloads a's row instead of clobbering
+            with open(path, encoding="utf-8") as fh:
+                models = sorted(r["model"] for r in json.load(fh)["rows"])
+            self.assertEqual(models, ["a", "b"])
+
+    def test_foreign_write_with_equal_mtime_is_still_merged(self):
+        # A restored backup / rsync -t / coarse filesystem leaves mtime equal:
+        # mtime-based detection misses it, the content hash does not.
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "h.json")
+            st = M.Store(path)
+            st.add([{"endpoint": "e", "model": "mine", "ok": True}])
+            st.save()
+            before = os.stat(path)
+            with open(path, "w", encoding="utf-8") as fh:
+                json.dump({"version": 1, "rows": [
+                    {"endpoint": "e", "model": "theirs", "ok": True}]}, fh)
+            os.utime(path, (before.st_atime, before.st_mtime))
+            st.add([{"endpoint": "e", "model": "mine2", "ok": True}])
+            st.save()
+            with open(path, encoding="utf-8") as fh:
+                models = sorted(r["model"] for r in json.load(fh)["rows"])
+            self.assertEqual(models, ["mine2", "theirs"])
+
+    def test_append_is_one_atomic_step(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "h.json")
+            st = M.Store(path)
+            st.append([{"endpoint": "e", "model": "m", "ok": True}])
+            st2 = M.Store(path)
+            self.assertEqual(len(st2.for_model("e", "m")), 1)
+            self.assertEqual([f for f in os.listdir(tmp) if f.endswith(".tmp")], [])
+
+    def test_corrupt_history_is_copied_aside_not_destroyed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "h.json")
+            with open(path, "w", encoding="utf-8") as fh:
+                fh.write("{not json")
+            st = M.Store(path)
+            self.assertEqual(st.rows, [])
+            st.append([{"endpoint": "e", "model": "m", "ok": True}])
+            backups = [f for f in os.listdir(tmp) if ".corrupt-" in f]
+            self.assertEqual(len(backups), 1)
+            with open(os.path.join(tmp, backups[0]), encoding="utf-8") as fh:
+                self.assertEqual(fh.read(), "{not json")
+
+    def test_lock_file_is_reused_not_grown(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "h.json")
+            st = M.Store(path)
+            for i in range(3):
+                st.append([{"endpoint": "e", "model": "m", "ok": True, "n": i}])
+            self.assertLessEqual(os.path.getsize(path + ".lock"), 8)
+
+    def test_a_server_instance_sees_rows_written_by_another(self):
+        # A long-running hosted server only has its own in-memory rows; a CLI
+        # probe batch must show up in its next ranking.
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "h.json")
+            cfg = os.path.join(tmp, "config.json")
+            with open(cfg, "w", encoding="utf-8") as fh:
+                json.dump({"endpoints": [{"name": "x", "base_url": "http://h/v1"}]}, fh)
+            server, cli = M.Store(path), M.Store(path)
+            ep = M.Endpoint({"name": "x", "base_url": "http://h/v1"})
+            orig_get = M._get
+            M._get = lambda *a, **k: (200, {"data": [{"id": "m"}]}, 1.0)
+            try:
+                cli.append([row(True, 200, 100.0, endpoint="x", model="m")])
+                ranking = M.build_ranking(server, [ep])
+            finally:
+                M._get = orig_get
+            self.assertEqual(len(ranking), 1)
+            self.assertEqual(ranking[0]["attempts"], 1)
+            self.assertEqual(ranking[0]["verdict"], "healthy")
+
+    def test_writer_threads_against_the_same_file_all_land(self):
+        import threading
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "h.json")
+            errors = []
+            def work(n):
+                try:
+                    st = M.Store(path)
+                    for i in range(5):
+                        st.append([{"endpoint": "e", "model": f"m{n}", "ok": True, "n": i}])
+                except Exception as exc:
+                    errors.append(exc)
+            threads = [threading.Thread(target=work, args=(i,)) for i in range(6)]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join()
+            self.assertEqual(errors, [])
+            st = M.Store(path)
+            for n in range(6):
+                self.assertEqual(len(st.for_model("e", f"m{n}")), 5, n)
+
+
 class StoreConcurrencyTest(unittest.TestCase):
     def test_concurrent_saves_use_unique_temp_files(self):
         import threading

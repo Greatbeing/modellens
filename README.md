@@ -202,7 +202,11 @@ Every probe is a real request, so the numbers are evidence, not estimates.
 | Cancellation rate | 20% | Timeouts and client cancellations |
 
 History is kept per model (newest 200 probes) in `history.json`, so rankings
-improve as you use it.
+improve as you use it. One file can be shared by several writers — the CLI, the
+MCP server and the hosted x402 server coordinate through an advisory file lock
+and merge on write, so a concurrent probe batch is never clobbered; a history
+file that cannot be parsed is copied aside as `history.json.corrupt-<ts>`
+instead of being overwritten.
 
 ---
 
