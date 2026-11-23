@@ -163,6 +163,24 @@ class StoreTest(unittest.TestCase):
         self.assertEqual([r["probed_at"] for r in kept],
                          ["2026-01-01T00:00:03Z", "2026-01-01T00:00:04Z"])
 
+    def test_trim_without_timestamps_keeps_the_newest_in_order(self):
+        # Rows pushed by the worker / imported by hand have no probed_at.
+        # Sorting a newest-first bucket on a missing key kept [newest, oldest]
+        # and silently dropped the middle of the history.
+        st = M.Store("", keep=2)
+        for i in range(10):
+            st.add([{"endpoint": "e", "model": "m", "ok": True,
+                     "status": 200, "latency_ms": 1.0, "n": i}])
+        self.assertEqual([r["n"] for r in st.for_model("e", "m")], [8, 9])
+
+    def test_trim_keeps_each_model_separately(self):
+        st = M.Store("", keep=2)
+        for i in range(5):
+            st.add([{"endpoint": "e", "model": "noisy", "ok": True, "n": i},
+                    {"endpoint": "e", "model": "quiet", "ok": True, "n": i}])
+        self.assertEqual([r["n"] for r in st.for_model("e", "noisy")], [3, 4])
+        self.assertEqual([r["n"] for r in st.for_model("e", "quiet")], [3, 4])
+
     def test_save_load_roundtrip(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = os.path.join(tmp, "sub", "history.json")
@@ -293,22 +311,38 @@ class DiscoveryTest(unittest.TestCase):
 class ProbeTest(unittest.TestCase):
     def setUp(self):
         self._orig_post = M._post
+        self._orig_stream = M._open_stream
+        self._orig_sse = M._probe_stream_sse
 
     def tearDown(self):
         M._post = self._orig_post
+        M._open_stream = self._orig_stream
+        M._probe_stream_sse = self._orig_sse
+
+    def _stream_ok(self, ttft_ms=40.0, total_ms=90.0):
+        M._open_stream = lambda ep, model: (200, object(), ttft_ms, None)
+        return None
 
     def test_probe_success_and_stream(self):
-        def fake(url, payload, timeout, headers=None):
-            if payload.get("stream"):
-                return 200, {"choices": [{"message": {"content": ""}}]}, 5.0
+        def fake_post(url, payload, timeout, headers=None):
             return 200, {"choices": [{"message": {"content": "OK"}}]}, 12.0
 
-        M._post = fake
-        ep = M.Endpoint({"name": "x", "base_url": "http://h/v1"})
-        out = M.probe_model(ep, "m")
+        M._post = fake_post
+        M._open_stream = lambda ep, model: (200, object(), 30.0, None)
+        # The SSE reader is exercised separately; here it is stubbed to succeed
+        # so this test covers the non-stream decision path only.
+        orig = M._probe_stream_sse
+        M._probe_stream_sse = lambda ep, model: {
+            "ok": True, "status": 200, "ttft_ms": 30.0, "latency_ms": 60.0, "error": None}
+        try:
+            ep = M.Endpoint({"name": "x", "base_url": "http://h/v1"})
+            out = M.probe_model(ep, "m")
+        finally:
+            M._probe_stream_sse = orig
         self.assertTrue(out["ok"])
         self.assertEqual(out["latency_ms"], 12.0)
         self.assertTrue(out["stream_ok"])
+        self.assertEqual(out["ttft_ms"], 30.0)
 
     def test_probe_error_path(self):
         M._post = lambda *a, **k: (429, {"error": {"message": "quota"}}, 3.0)
@@ -317,6 +351,281 @@ class ProbeTest(unittest.TestCase):
         self.assertFalse(out["ok"])
         self.assertEqual(out["status"], 429)
         self.assertEqual(out["error"], "quota")
+
+    def test_probe_does_not_stream_when_first_call_failed(self):
+        M._post = lambda *a, **k: (500, {}, 3.0)
+        called = []
+        M._probe_stream_sse = lambda ep, model: called.append(1) or {
+            "ok": True, "status": 200, "ttft_ms": 1.0, "latency_ms": 1.0, "error": None}
+        ep = M.Endpoint({"name": "x", "base_url": "http://h/v1"})
+        out = M.probe_model(ep, "m")
+        self.assertFalse(out["ok"])
+        self.assertEqual(called, [])  # no point paying for a stream of a dead model
+        self.assertIsNone(out["stream_ok"])
+
+
+class ProbeValidationTest(unittest.TestCase):
+    """HTTP 200 is not success. Each case here is a real gateway lying."""
+
+    def test_error_body_with_200_is_failure(self):
+        valid, reason = M._is_valid_chat_response(
+            {"error": {"message": "insufficient quota", "code": 429}})
+        self.assertFalse(valid)
+        self.assertEqual(reason, "body_error")
+
+    def test_raw_wrapper_is_not_a_completion(self):
+        # _maybe_json wraps non-JSON (502 HTML, empty body) as {"raw": ...}.
+        self.assertFalse(M._is_valid_chat_response({"raw": "<html>502</html>"})[0])
+        self.assertEqual(M._is_valid_chat_response({"raw": ""}), (False, "non_json_raw"))
+
+    def test_empty_choices_is_failure(self):
+        self.assertEqual(M._is_valid_chat_response({"choices": []}), (False, "empty_choices"))
+        self.assertEqual(M._is_valid_chat_response({}), (False, "non_json_raw"))
+
+    def test_empty_content_is_failure(self):
+        body = {"choices": [{"message": {"content": "   "}}]}
+        self.assertEqual(M._is_valid_chat_response(body), (False, "empty_content"))
+
+    def test_finish_reason_error_is_failure(self):
+        body = {"choices": [{"finish_reason": "error", "message": {"content": "x"}}]}
+        self.assertEqual(M._is_valid_chat_response(body), (False, "finish_error"))
+
+    def test_reasoning_or_tool_call_counts_as_payload(self):
+        self.assertTrue(M._is_valid_chat_response(
+            {"choices": [{"message": {"content": "", "reasoning_content": "think"}}]})[0])
+        self.assertTrue(M._is_valid_chat_response(
+            {"choices": [{"message": {"content": None,
+                                      "tool_calls": [{"function": {"name": "x"}}]}}]})[0])
+
+    def test_non_dict_is_failure(self):
+        self.assertEqual(M._is_valid_chat_response("ok"), (False, "non_json"))
+
+    def test_network_error_body_is_classified(self):
+        import socket as _socket
+        body = M._network_error_body(_socket.timeout("timed out"))
+        self.assertEqual(body["__error__"]["type"], "timeout")
+        self.assertIn("timed out", body["__error__"]["message"])
+
+    def test_failure_message_surfaces_transport_type(self):
+        text, etype = M._failure_message(0, {"__error__": {"type": "dns_error",
+                                                           "message": "no such host"}}, "")
+        self.assertEqual(etype, "dns_error")
+        self.assertIn("no such host", text)
+
+
+class StreamProbeTest(unittest.TestCase):
+    """_probe_stream_sse against a stubbed SSE transport."""
+
+    def setUp(self):
+        self._orig = M._open_stream
+
+    def tearDown(self):
+        M._open_stream = self._orig
+
+    def _serve(self, lines, status=200):
+        M._open_stream = lambda ep, model: (status, iter(lines), 10.0, None)
+
+    def test_reads_sse_and_measures_ttft(self):
+        self._serve([b'data: {"choices":[{"delta":{"content":"O"}}]}\n',
+                     b'data: {"choices":[{"delta":{"content":"K"}}]}\n',
+                     b'data: [DONE]\n'])
+        ep = M.Endpoint({"name": "x", "base_url": "http://h/v1"})
+        out = M._probe_stream_sse(ep, "m")
+        self.assertTrue(out["ok"])
+        self.assertIsNotNone(out["ttft_ms"])
+        self.assertGreaterEqual(out["latency_ms"], 0)
+
+    def test_done_without_tokens_is_not_ok(self):
+        self._serve([b'data: [DONE]\n'])
+        ep = M.Endpoint({"name": "x", "base_url": "http://h/v1"})
+        out = M._probe_stream_sse(ep, "m")
+        self.assertFalse(out["ok"])
+        self.assertIn("no token chunk", out["error"])
+
+    def test_error_event_inside_stream_is_failure(self):
+        self._serve([b'data: {"error":{"message":"upstream exploded"}}\n'])
+        ep = M.Endpoint({"name": "x", "base_url": "http://h/v1"})
+        out = M._probe_stream_sse(ep, "m")
+        self.assertFalse(out["ok"])
+        self.assertIn("upstream exploded", out["error"])
+
+    def test_non_200_stream_is_failure(self):
+        M._open_stream = lambda ep, model: (200, None, 5.0, "HTTP 502")
+        ep = M.Endpoint({"name": "x", "base_url": "http://h/v1"})
+        out = M._probe_stream_sse(ep, "m")
+        self.assertFalse(out["ok"])
+        self.assertIn("502", out["error"])
+
+    def test_garbage_lines_are_skipped(self):
+        self._serve([b': keepalive\n',
+                     b'data: not-json\n',
+                     b'data: {"choices":[{"delta":{"content":"hi"}}]}\n'])
+        ep = M.Endpoint({"name": "x", "base_url": "http://h/v1"})
+        out = M._probe_stream_sse(ep, "m")
+        self.assertTrue(out["ok"])
+
+
+class ArgParsingTest(unittest.TestCase):
+    def test_parse_bool_string_false_is_false(self):
+        # bool("false") is True in Python — the whole point of the helper.
+        self.assertFalse(M._parse_bool("false"))
+        self.assertFalse(M._parse_bool("0"))
+        self.assertFalse(M._parse_bool(False))
+        self.assertFalse(M._parse_bool(0))
+
+    def test_parse_bool_truthy(self):
+        for v in (True, 1, "1", "true", "TRUE", "yes", "on"):
+            self.assertTrue(M._parse_bool(v), v)
+
+    def test_parse_bool_garbage_falls_back(self):
+        self.assertTrue(M._parse_bool("maybe", default=True))
+        self.assertFalse(M._parse_bool("maybe", default=False))
+        self.assertFalse(M._parse_bool(None))
+
+    def test_clamp_int_bounds(self):
+        self.assertEqual(M._clamp_int(-5, 20, 1, 200), 1)      # no negative slice
+        self.assertEqual(M._clamp_int(50000, 1, 1, 16), 16)    # no thread storm
+        self.assertEqual(M._clamp_int("7", 20, 1, 200), 7)
+        self.assertEqual(M._clamp_int(None, 20, 1, 200), 20)
+        self.assertEqual(M._clamp_int("abc", 20, 1, 200), 20)
+
+    def test_ranking_default_limit_matches_schema(self):
+        # The schema advertises "(default 20)" — the code must use it too.
+        self.assertEqual(M.RANKING_DEFAULT_LIMIT, 20)
+        schema = {t[0]: t[2] for t in M.TOOLS}["ranking"]
+        self.assertIn("default 20", json.dumps(schema))
+        self.assertIn("all", schema)
+
+
+class ScoreEdgeTest(unittest.TestCase):
+    """Inputs that used to raise or mislead."""
+
+    def test_missing_latency_earns_no_latency_credit(self):
+        rows = [row(True, 200, lat=None) for _ in range(5)]
+        s = M.score_model(rows)  # used to TypeError: None / int
+        self.assertEqual(s["success_rate"], 100.0)
+        self.assertIsNone(s["median_latency_ms"])
+        self.assertEqual(s["verdict"], "mixed")
+        self.assertAlmostEqual(s["score"], 70.0, places=1)  # 50 + 0 + 20
+
+    def test_zero_latency_is_fast_not_skipped(self):
+        # `(med or 9e9)` made med == 0 read as unmeasured; it is just fast.
+        s = M.score_model([row(True, 200, lat=0.0) for _ in range(5)])
+        self.assertEqual(s["verdict"], "healthy")
+
+    def test_bool_latency_ignored(self):
+        rows = [row(True, 200, lat=True), row(True, 200, lat=100.0)]
+        s = M.score_model(rows)
+        self.assertEqual(s["median_latency_ms"], 100.0)
+
+    def test_auth_errors_are_named(self):
+        s = M.score_model([row(False, 401), row(False, 403)])
+        self.assertEqual(s["verdict"], "auth_error")
+        self.assertEqual(s["score"], 0.0)
+
+    def test_server_errors_are_failing_not_mixed(self):
+        s = M.score_model([row(False, 500), row(False, 502), row(False, 503)])
+        self.assertEqual(s["verdict"], "failing")
+        self.assertEqual(s["score"], 0.0)
+
+    def test_age_keeps_minute_precision(self):
+        now = 1790000000.0
+        ts = _iso(now - 17 * 60)  # 17 minutes ago
+        s = M.score_model([row(True, 200, 100.0, probed_at=ts)], now=now)
+        self.assertAlmostEqual(s["age_hours"] * 60, 17.0, places=0)
+        self.assertEqual(M._format_age(s["age_hours"]), "17m")  # not 18m from 0.3h
+
+    def test_all_failing_recommends_nothing(self):
+        failing = {"id": "e/x", "endpoint": "e", "model": "x", "score": 0.0,
+                   "success_rate": 0.0, "median_latency_ms": None,
+                   "verdict": "failing", "attempts": 3, "pricing": {}}
+        self.assertEqual(M.recommend([failing], "capable")["picks"], [])
+
+
+class CliTest(unittest.TestCase):
+    """The README's CLI examples must actually run (argparse used to reject them)."""
+
+    def _run(self, *argv):
+        import subprocess
+        env = dict(os.environ, MODELLENS_CONFIG="", MODELLENS_DATA="",
+                   PYTHONIOENCODING="utf-8")
+        return subprocess.run(
+            [sys.executable, os.path.join(REPO_ROOT, "modellens.py"), *argv],
+            env=env, capture_output=True, text=True, timeout=60)
+
+    def test_version_flag(self):
+        r = self._run("--version")
+        self.assertEqual(r.returncode, 0)
+        self.assertIn(M.SERVER_VERSION, r.stdout)
+
+    def test_once_probe_accepts_documented_flags(self):
+        r = self._run("--once", "probe", "--limit", "2", "--workers", "2",
+                      "--check-tools", "--no-stream")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("No models matched", r.stdout)
+
+    def test_once_ranking_accepts_limit_and_all(self):
+        r = self._run("--once", "ranking", "--limit", "5", "--all")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("No models discovered", r.stdout)
+
+    def test_once_recommend_accepts_profile(self):
+        r = self._run("--once", "recommend", "--profile", "fast")
+        self.assertEqual(r.returncode, 0, r.stderr)
+
+
+class ProtocolRobustnessTest(unittest.TestCase):
+    def setUp(self):
+        self.ctx = M.Context("", "")
+
+    def test_non_object_message_is_invalid_request_not_a_crash(self):
+        for bad in ([], "hi", 7, None):
+            r = M.handle(self.ctx, bad)
+            self.assertIsNotNone(r, bad)
+            self.assertEqual(r["error"]["code"], -32600, bad)
+
+    def test_tools_call_without_params_is_error(self):
+        r = M.handle(self.ctx, {"id": 1, "method": "tools/call"})
+        self.assertEqual(r["error"]["code"], -32602)
+
+    def test_tools_call_with_non_object_args_defaults(self):
+        r = M.handle(self.ctx, {"id": 2, "method": "tools/call",
+                                "params": {"name": "list_models", "arguments": "nope"}})
+        self.assertIn("result", r)
+
+
+class StoreConcurrencyTest(unittest.TestCase):
+    def test_concurrent_saves_use_unique_temp_files(self):
+        import threading
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "history.json")
+            errors = []
+
+            def work(n):
+                try:
+                    st = M.Store(path)
+                    st.add([row(True, 200, float(n), model="m%d" % n)])
+                    for _ in range(10):
+                        st.save()
+                except Exception as exc:  # a fixed .tmp name races here
+                    errors.append(exc)
+
+            threads = [threading.Thread(target=work, args=(i,)) for i in range(6)]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join()
+            self.assertEqual(errors, [])
+            self.assertTrue(os.path.exists(path))
+            import glob as _glob
+            self.assertEqual(_glob.glob(os.path.join(tmp, "*.tmp")), [])
+
+    def test_for_model_reads_a_snapshot(self):
+        st = M.Store("")
+        st.add([row(True, 200, 1.0, model="m")])
+        got = st.for_model("e", "m")
+        got.clear()  # mutating the returned list must not corrupt the store
+        self.assertEqual(len(st.for_model("e", "m")), 1)
 
 
 class McpProtocolTest(unittest.TestCase):

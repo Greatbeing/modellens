@@ -15,6 +15,15 @@
 
 const USDC_BASE = '0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913';
 const NETWORK = 'eip155:8453';
+// Browser-hosted MCP clients (the Inspector runs in a page) preflight every
+// request; without these an OPTIONS /mcp becomes a 404 and the call never
+// happens. PAYMENT-* must be exposed or the client cannot read the challenge.
+const CORS = {
+  'Access-Control-Allow-Origin': '*',
+  'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
+  'Access-Control-Allow-Headers': 'Content-Type, Authorization, X-PAYMENT, Mcp-Session-Id',
+  'Access-Control-Expose-Headers': 'PAYMENT-REQUIRED, PAYMENT-RESPONSE',
+};
 
 const PRICES = {
   list_models: 0,
@@ -51,8 +60,10 @@ const TOOLS = [
         endpoint: { type: 'string', description: 'optional endpoint name' },
         model: { type: 'string', description: 'exact model id' },
         contains: { type: 'string', description: 'substring filter on model id' },
-        limit: { type: 'string', description: 'max models (default 20)' },
+        limit: { type: 'string', description: 'max models (default 20, capped server-side)' },
         check_tools: { type: 'string', description: 'also test function calling' },
+        check_stream: { type: 'string', description: 'also test streaming and measure TTFT (default on)' },
+        workers: { type: 'string', description: 'parallel workers (default 1, capped server-side)' },
       },
       required: [],
     },
@@ -65,7 +76,7 @@ const TOOLS = [
     annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
     inputSchema: {
       type: 'object',
-      properties: { limit: { type: 'string', description: 'rows to show (default 30)' } },
+      properties: { limit: { type: 'string', description: 'rows to show (default 20)' } },
       required: [],
     },
     x402Price: '$0.01',
@@ -135,22 +146,34 @@ async function facilitator(env, path, body) {
   return r.json();
 }
 
-async function verifyAndSettle(env, xPayment, req) {
+async function verifyPayment(env, xPayment, req) {
+  // Phase 1 — verify only. NO money moves yet, so a later tool failure
+  // leaves the caller uncharged.
   let payload;
   try {
     payload = JSON.parse(new TextDecoder().decode(unb64url(xPayment)));
   } catch (e) {
-    return { ok: false, error: 'bad X-PAYMENT: ' + e.message };
+    return { ok: false, payload: null, error: 'bad X-PAYMENT payload' };
   }
   const body = { x402Version: 1, paymentPayload: payload, paymentRequirements: req };
   try {
     const v = await facilitator(env, '/verify', body);
-    if (!v.isValid) return { ok: false, error: 'invalid payment: ' + JSON.stringify(v).slice(0, 200) };
+    if (!v.isValid) return { ok: false, payload: null, error: 'invalid payment: ' + JSON.stringify(v).slice(0, 200) };
+    return { ok: true, payload };
+  } catch (e) {
+    return { ok: false, payload, error: 'facilitator error: ' + e.message };
+  }
+}
+
+async function settlePayment(env, payload, req) {
+  // Phase 2 — settle on-chain. Call ONLY after the tool has succeeded.
+  const body = { x402Version: 1, paymentPayload: payload, paymentRequirements: req };
+  try {
     const s = await facilitator(env, '/settle', body);
     if (!s.success) return { ok: false, tx: s.transaction, error: 'settle failed: ' + JSON.stringify(s).slice(0, 200) };
     return { ok: true, tx: s.transaction };
   } catch (e) {
-    return { ok: false, error: 'facilitator error: ' + e.message };
+    return { ok: false, tx: null, error: 'facilitator error: ' + e.message };
   }
 }
 
@@ -170,8 +193,11 @@ function parseTs(s) {
 }
 
 function formatAge(ageHours) {
+  // Raw (unrounded) hours in, so minutes land on real minutes instead of the
+  // 6-minute grid a 0.1h pre-rounding would impose.
   if (ageHours == null) return '-';
-  if (ageHours < 1) return Math.max(1, Math.round(ageHours * 60)) + 'm';
+  const minutes = ageHours * 60;
+  if (minutes < 60) return Math.max(1, Math.round(minutes)) + 'm';
   if (ageHours < 48) return Math.round(ageHours) + 'h';
   return Math.round(ageHours / 24) + 'd';
 }
@@ -209,15 +235,19 @@ function scoreModel(rows, nowMs) {
     const t = parseTs(r.probed_at);
     if (t != null && (lastTs == null || t > lastTs)) lastTs = t;
   }
-  const age_hours = lastTs == null ? null : Math.max(0, Math.round(((now - lastTs) / 3600000) * 10) / 10);
+  // Raw age, like modellens.py: staleness compares unrounded hours and
+  // formatAge needs minute precision.
+  const age_hours = lastTs == null ? null : Math.max(0, (now - lastTs) / 3600000);
   const last_probed_at = lastTs == null ? null : new Date(lastTs).toISOString().replace(/\.\d{3}Z$/, 'Z');
 
   let verdict;
   if (attempts === 0) verdict = 'untested';
   else if (success_rate === 0 && rows.every((r) => r.status === 404)) verdict = 'dead';
   else if (success_rate === 0 && rows.every((r) => r.status === 429)) verdict = 'quota_blocked';
+  else if (success_rate === 0 && rows.every((r) => r.status === 401 || r.status === 403)) verdict = 'auth_error';
   else if (cancel_rate >= 30) verdict = 'unreliable';
-  else if (success_rate >= 95 && (med == null ? 9e9 : med) < 3000) verdict = 'healthy';
+  else if (success_rate >= 95 && med != null && med < 3000) verdict = 'healthy';
+  else if (success_rate === 0) verdict = 'failing';
   else verdict = 'mixed';
 
   if (attempts && success_rate > 0 && (verdict === 'healthy' || verdict === 'mixed')
@@ -228,7 +258,9 @@ function scoreModel(rows, nowMs) {
              cancel_rate: round1(cancel_rate), median_latency_ms: null, score: 0, verdict,
              last_probed_at, age_hours };
   }
-  const latency_score = Math.max(0, Math.min(1, 1 - med / 8000)) * 100;
+  // Unknown latency (ok rows with no latency recorded) earns no latency
+  // credit — same as the Python core, and it keeps null out of the math.
+  const latency_score = med == null ? 0 : Math.max(0, Math.min(1, 1 - med / 8000)) * 100;
   const score = (success_rate * 50 + latency_score * 30 + Math.max(0, 100 - cancel_rate * 2) * 20) / 100;
   return { attempts, ok: oks.length, failed: attempts - oks.length, cancelled,
            success_rate: round1(success_rate), cancel_rate: round1(cancel_rate),
@@ -237,17 +269,36 @@ function scoreModel(rows, nowMs) {
 }
 
 function aggregate(rows, nowMs) {
+  // Group by endpoint AND model: the same model id (gpt-4o-mini) served by two
+  // gateways is two different qualities — merging them would misrank both and
+  // diverge from the Python core, which keys history on (endpoint, model).
   const byModel = {};
   for (const r of rows || []) {
     if (!r.model) continue;
-    (byModel[r.model] = byModel[r.model] || []).push(r);
+    const key = `${r.endpoint || 'default'}/${r.model}`;
+    (byModel[key] = byModel[key] || []).push(r);
   }
   const out = [];
-  for (const [m, rs] of Object.entries(byModel)) out.push({ model: m, ...scoreModel(rs, nowMs) });
+  for (const [key, rs] of Object.entries(byModel)) {
+    out.push({
+      id: key,
+      endpoint: (rs[0] && rs[0].endpoint) || 'default',
+      model: (rs[0] && rs[0].model) || key,
+      ...scoreModel(rs, nowMs),
+    });
+  }
   out.sort((a, b) => b.score - a.score
     || (a.median_latency_ms ?? 1e12) - (b.median_latency_ms ?? 1e12)
-    || a.model.localeCompare(b.model));
+    || a.id.localeCompare(b.id));
   return out;
+}
+
+// Clamp parsed limits: NaN/0/negative fall back to default, anything above cap
+// clamps (a negative would become a JS slice from the end).
+function parseLimit(v, dflt, cap) {
+  const n = parseInt(v, 10);
+  if (Number.isNaN(n)) return dflt;
+  return Math.min(Math.max(n, 1), cap);
 }
 
 async function toolListModels(env, args) {
@@ -258,7 +309,9 @@ async function toolListModels(env, args) {
   let models = snap.models || [];
   if (pattern) models = models.filter((m) => m.toLowerCase().includes(pattern));
   const limit = parseInt(args.limit || '0', 10);
-  if (limit) models = models.slice(0, limit);
+  // NaN / 0 / negative all mean "no limit" here; a negative must never slice
+  // from the end (that would return the *last* models).
+  if (limit > 0) models = models.slice(0, Math.min(limit, 1000));
   return `## ${snap.endpoint || 'endpoint'}  (${snap.base_url || ''}) — ${models.length} models\n` + models.map((m) => '- ' + m).join('\n');
 }
 
@@ -266,10 +319,10 @@ async function toolRanking(env, args) {
   const raw = await env.DATA.get('history');
   if (!raw) return 'no probe history yet';
   const rows = aggregate(JSON.parse(raw).rows);
-  const limit = parseInt(args.limit || '30', 10);
-  const lines = ['| model | score | success | cancel | median | n | verdict | age |', '| --- | --- | --- | --- | --- | --- | --- | --- |'];
+  const limit = parseLimit(args.limit, 20, 200);
+  const lines = ['| endpoint | model | score | success | cancel | median | n | verdict | age |', '| --- | --- | --- | --- | --- | --- | --- | --- | --- |'];
   for (const r of rows.slice(0, limit)) {
-    lines.push(`| ${r.model} | ${r.score} | ${r.success_rate}% | ${r.cancel_rate}% | ${r.median_latency_ms != null ? Math.round(r.median_latency_ms) + 'ms' : '-'} | ${r.attempts} | ${r.verdict} | ${formatAge(r.age_hours)} |`);
+    lines.push(`| ${r.endpoint} | ${r.model} | ${r.score} | ${r.success_rate}% | ${r.cancel_rate}% | ${r.median_latency_ms != null ? Math.round(r.median_latency_ms) + 'ms' : '-'} | ${r.attempts} | ${r.verdict} | ${formatAge(r.age_hours)} |`);
   }
   const stale = rows.filter((r) => r.verdict === 'stale').length;
   if (stale) lines.push(`\n(${stale} stale — not probed in the last ${STALE_AFTER_HOURS}h, never recommended)`);
@@ -280,7 +333,8 @@ async function toolRecommend(env, args) {
   const raw = await env.DATA.get('history');
   if (!raw) return 'no probe history yet';
   const rows = aggregate(JSON.parse(raw).rows);
-  let usable = rows.filter((r) => r.score > 0 && r.verdict !== 'dead' && r.verdict !== 'quota_blocked' && r.verdict !== 'stale');
+  let usable = rows.filter((r) => r.score > 0
+    && !['dead', 'quota_blocked', 'auth_error', 'failing', 'stale'].includes(r.verdict));
   if (!usable.length) {
     if (rows.some((r) => r.verdict === 'stale')) return `all models with a passing score are stale (not probed in the last ${STALE_AFTER_HOURS}h) — probe again for a fresh recommendation`;
     return 'no model has a passing score yet';
@@ -310,21 +364,24 @@ async function toolReport(env) {
   const rows = aggregate(h.rows);
   const counts = {};
   for (const r of rows) counts[r.verdict] = (counts[r.verdict] || 0) + 1;
+  const endpoints = new Set(rows.map((r) => r.endpoint));
   const lines = [
     '# ModelLens report',
     '',
-    `- endpoints: 1`,
+    `- endpoints: ${endpoints.size}`,
     `- models discovered: ${rows.length}`,
     `- probes recorded: ${(h.rows || []).length}`,
     '',
     '## Verdicts',
-    ...['healthy', 'mixed', 'unreliable', 'quota_blocked', 'dead', 'stale', 'untested'].filter((k) => counts[k]).map((k) => `- ${k}: ${counts[k]}`),
+    ...['healthy', 'mixed', 'unreliable', 'quota_blocked', 'auth_error', 'failing',
+        'dead', 'stale', 'untested']
+      .filter((k) => counts[k]).map((k) => `- ${k}: ${counts[k]}`),
     '',
     '## Top 15 by score',
     '',
-    '| model | score | success | cancel | median | n | verdict | age |',
-    '| --- | --- | --- | --- | --- | --- | --- | --- |',
-    ...rows.slice(0, 15).map((r) => `| ${r.model} | ${r.score} | ${r.success_rate}% | ${r.cancel_rate}% | ${r.median_latency_ms != null ? Math.round(r.median_latency_ms) + 'ms' : '-'} | ${r.attempts} | ${r.verdict} | ${formatAge(r.age_hours)} |`),
+    '| endpoint | model | score | success | cancel | median | n | verdict | age |',
+    '| --- | --- | --- | --- | --- | --- | --- | --- | --- |',
+    ...rows.slice(0, 15).map((r) => `| ${r.endpoint} | ${r.model} | ${r.score} | ${r.success_rate}% | ${r.cancel_rate}% | ${r.median_latency_ms != null ? Math.round(r.median_latency_ms) + 'ms' : '-'} | ${r.attempts} | ${r.verdict} | ${formatAge(r.age_hours)} |`),
     '',
     `_Snapshot pushed ${h.updated_at || 'unknown'}_`,
   ];
@@ -358,6 +415,11 @@ async function runTool(env, name, args) {
 }
 
 async function handleMcp(env, req, msg) {
+  // Valid JSON need not be a JSON-RPC message: null, an array or a bare
+  // string would make msg.method throw (null) or silently misbehave.
+  if (!msg || typeof msg !== 'object' || Array.isArray(msg)) {
+    return jsonrpcError(null, -32600, 'invalid request: JSON-RPC message must be an object');
+  }
   const method = msg.method;
   const id = msg.id;
   const host = new URL(req.url).host;
@@ -367,7 +429,7 @@ async function handleMcp(env, req, msg) {
     return jsonrpc(id, {
       protocolVersion: '2025-06-18',
       capabilities: { tools: {} },
-      serverInfo: { name: 'modellens-x402', version: '0.1.5' },
+      serverInfo: { name: 'modellens-x402', version: '0.1.6' },
     });
   }
   if (method && method.startsWith('notifications/')) return null;
@@ -375,8 +437,10 @@ async function handleMcp(env, req, msg) {
   if (method === 'tools/list') return jsonrpc(id, { tools: TOOLS });
 
   if (method === 'tools/call') {
-    const name = (msg.params || {}).name;
-    const args = (msg.params || {}).arguments || {};
+    const params = (msg.params && typeof msg.params === 'object') ? msg.params : {};
+    const name = typeof params.name === 'string' ? params.name : '';
+    const args = (params.arguments && typeof params.arguments === 'object') ? params.arguments : {};
+    if (!name) return jsonrpcError(id, -32602, 'missing tool name');
     const price = PRICES[name] || 0;
 
     if (price > 0) {
@@ -390,12 +454,30 @@ async function handleMcp(env, req, msg) {
           body: jsonrpcError(id, 402, 'payment required', { x402: challenge }),
         };
       }
-      const res = await verifyAndSettle(env, xpay, req402);
-      if (!res.ok) return { status: 402, body: jsonrpcError(id, 402, res.error) };
-      const text = await runTool(env, name, args);
+      // Two-phase payment: verify (no money moved) -> run tool -> settle only
+      // after execution. Settling first would charge the caller for a failed
+      // call with no refund path.
+      const v = await verifyPayment(env, xpay, req402);
+      if (!v.ok) return { status: 402, body: jsonrpcError(id, 402, v.error) };
+      let text;
+      try {
+        text = await runTool(env, name, args);
+      } catch (e) {
+        console.error(`tool ${name} failed after verify; not settling: ${e && e.message}`);
+        return { status: 200, body: jsonrpc(id, { content: [{ type: 'text', text: 'tool error: ' + (e && e.message) }], isError: true }) };
+      }
+      const s = await settlePayment(env, v.payload, req402);
+      const headers = {};
+      if (s.ok) {
+        headers['PAYMENT-RESPONSE'] = b64url(new TextEncoder().encode(JSON.stringify({ x402Version: 1, transaction: s.tx, network: NETWORK })));
+      } else {
+        // The caller got their answer; the settlement failure is the
+        // operator's problem — log it, don't punish the caller.
+        console.error(`settle failed for ${name}: ${s.error}`);
+      }
       return {
         status: 200,
-        headers: { 'PAYMENT-RESPONSE': b64url(new TextEncoder().encode(JSON.stringify({ x402Version: 1, transaction: res.tx, network: NETWORK }))) },
+        headers,
         body: jsonrpc(id, { content: [{ type: 'text', text }] }),
       };
     }
@@ -406,19 +488,42 @@ async function handleMcp(env, req, msg) {
   return jsonrpcError(id, -32601, 'method not found');
 }
 
+// Constant-time string compare for the ingest secret. Hashing both sides to a
+// fixed 32 bytes first makes the loop length-independent, so neither the value
+// nor the secret's length leaks through response timing.
+async function timingSafeEqual(a, b) {
+  const enc = new TextEncoder();
+  const [da, db] = await Promise.all([
+    crypto.subtle.digest('SHA-256', enc.encode(String(a == null ? '' : a))),
+    crypto.subtle.digest('SHA-256', enc.encode(String(b == null ? '' : b))),
+  ]);
+  const va = new Uint8Array(da);
+  const vb = new Uint8Array(db);
+  let diff = 0;
+  for (let i = 0; i < va.length; i++) diff |= va[i] ^ vb[i];
+  return diff === 0;
+}
+
 export default {
   async fetch(req, env) {
     try {
       return await this._fetch(req, env);
     } catch (e) {
-      return new Response(
-        'worker error: ' + (e && e.stack ? e.stack : String(e)),
-        { status: 500, headers: { 'Content-Type': 'text/plain' } }
-      );
+      // Log the stack here; never put it in the response. A stack trace leaks
+      // file paths, bindings and dependency versions to any anonymous caller.
+      console.error('worker error:', e && e.stack ? e.stack : String(e));
+      return new Response('worker error', {
+        status: 500,
+        headers: { 'Content-Type': 'text/plain' },
+      });
     }
   },
   async _fetch(req, env) {
     const url = new URL(req.url);
+
+    if (req.method === 'OPTIONS') {
+      return new Response(null, { status: 204, headers: CORS });
+    }
 
     if (url.pathname === '/.well-known/x402' && req.method === 'GET') {
       return Response.json({
@@ -434,16 +539,25 @@ export default {
     }
 
     if (url.pathname === '/health' && req.method === 'GET') {
-      return Response.json({ ok: true, server: 'modellens-x402-worker', version: '0.1.5' });
+      return Response.json({ ok: true, server: 'modellens-x402-worker', version: '0.1.6' });
     }
 
     // ingest: being pushes history + models snapshots
     if (url.pathname === '/ingest' && req.method === 'POST') {
       const secret = env.INGEST_SECRET;
-      if (!secret || req.headers.get('X-Ingest-Secret') !== secret) {
+      const provided = req.headers.get('X-Ingest-Secret') || '';
+      if (!secret || !(await timingSafeEqual(provided, secret))) {
         return new Response('unauthorized', { status: 401 });
       }
-      const body = await req.json();
+      let body;
+      try {
+        body = await req.json();
+      } catch {
+        return Response.json({ error: 'bad json' }, { status: 400 });
+      }
+      if (!body || typeof body !== 'object') {
+        return Response.json({ error: 'expected an object' }, { status: 400 });
+      }
       if (body.history) await env.DATA.put('history', JSON.stringify(body.history));
       if (body.models) await env.DATA.put('models', JSON.stringify(body.models));
       return Response.json({ ok: true });
@@ -454,16 +568,25 @@ export default {
       try {
         msg = await req.json();
       } catch {
-        return Response.json({ error: 'bad json' }, { status: 400 });
+        return Response.json({ error: 'bad json' }, { status: 400, headers: CORS });
       }
       const out = await handleMcp(env, req, msg);
-      if (out === null) return new Response(null, { status: 202 });
-      return Response.json(out.body, { status: out.status || 200, headers: out.headers || {} });
+      if (out === null) return new Response(null, { status: 202, headers: CORS });
+      // handleMcp returns a bare JSON-RPC message for protocol methods and a
+      // {status, headers, body} envelope for tools/call. Normalise both: reading
+      // out.body unconditionally made initialize/tools/list return an EMPTY
+      // body (JSON.stringify(undefined) is undefined), which every MCP client
+      // reads as a protocol failure.
+      const payload = (out && out.body !== undefined) ? out.body : out;
+      return Response.json(payload, {
+        status: (out && out.status) || 200,
+        headers: { ...CORS, ...((out && out.headers) || {}) },
+      });
     }
 
-    return new Response('not found', { status: 404 });
+    return new Response('not found', { status: 404, headers: CORS });
   },
 };
 
 // Named exports for unit tests (wrangler only uses the default export).
-export { median, scoreModel, aggregate, round1 };
+export { median, scoreModel, aggregate, round1, formatAge, parseLimit, timingSafeEqual };

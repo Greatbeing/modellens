@@ -129,7 +129,7 @@ Then restart `dsh web`. Verified: the server runs as a child process of
 | Tool | What it does |
 |---|---|
 | `list_models` | What each endpoint advertises (optional substring filter) |
-| `probe` | Real requests: latency, success, streaming, tool calls (`workers` optional) |
+| `probe` | Real requests: latency, success, streaming + TTFT, tool calls (`workers` optional) |
 | `ranking` | Quality ranking from recorded history |
 | `recommend` | Best model for a profile: `fast` (≥90% success) \| `cheap` (zero-priced if advertised) \| `capable` |
 | `report` | The whole picture as markdown |
@@ -140,13 +140,24 @@ live read-only `GET /models` on each endpoint (no inference, no token cost).
 ### Example
 
 ```
-probe(limit=20, check_tools=true)
+probe(limit=20, check_tools=true, check_stream=true)
 ranking(limit=10)
 recommend(profile="fast")
 ```
 
 `probe(workers=4)` runs probes concurrently (faster, but see the honest notes:
-concurrency can self-induce 429s). Default is `workers=1` — sequential.
+concurrency can self-induce 429s). Default is `workers=1` — sequential. `limit`
+and `workers` are clamped (1–200, 1–16): `limit=-5` would otherwise slice
+backwards and `workers=500` would fork 500 threads.
+
+A probe only counts as success when the response is an actual completion. An
+HTTP 200 that carries `{"error": ...}` (gateways wrap upstream failures like
+this), `choices: []`, empty content, or a non-JSON body is recorded as a
+failure with the reason — a status code alone is not evidence.
+
+`check_stream` (on by default) opens a real `stream: true` request and measures
+time-to-first-token (TTFT); `stream_ok` means the SSE stream delivered at least
+one real token chunk and contained no error event.
 
 ### Hosted / paid (x402, USDC on Base)
 
@@ -161,9 +172,22 @@ accounts or API keys:
 
 An unpaid paid-tool call returns `HTTP 402` + `PAYMENT-REQUIRED`; the agent
 signs an EIP-3009 USDC transfer and retries with `X-PAYMENT`, the facilitator
-verifies/settles, and the tool result comes back with a `PAYMENT-RESPONSE`.
-Self-host the same server anywhere with `python3 server_x402.py`
-(set `X402_PAY_TO` to your receiving address; see `server_x402.py` header).
+verifies the signature, the tool runs, and only then is the payment settled —
+so a call that fails on our side (bad arguments, unknown model, upstream 5xx)
+never costs the caller money. A successful call returns `PAYMENT-RESPONSE`.
+Self-host the same server anywhere with `python3 server_x402.py`;
+`X402_PAY_TO` (your receiving address) is **required** — the server refuses to
+start without it rather than quietly paying a hardcoded address. Hosted-mode
+caps: `X402_MAX_PROBE_LIMIT` (default 20) and `X402_MAX_PROBE_WORKERS`
+(default 4) clamp what a paid caller can ask for, and browsers get CORS
+headers plus an `OPTIONS` preflight on `/mcp`.
+
+Verdicts: `healthy` (≥95% success, <3 s median) · `mixed` · `unreliable`
+(≥30% cancelled) · `quota_blocked` (all 429) · `auth_error` (all 401/403 — a
+key/permission problem, not a flaky model) · `dead` (all 404) · `failing` (0%
+success from real errors such as 5xx/timeouts) · `stale` (not probed in the
+last 6 h — the evidence is too old to route on, so the model is never
+recommended) · `untested`.
 
 ---
 
@@ -174,13 +198,8 @@ Every probe is a real request, so the numbers are evidence, not estimates.
 | Signal | Weight | Notes |
 |---|---|---|
 | Success rate | 50% | 0% success ⇒ score 0, regardless of anything else |
-| Median latency | 30% | Linear to 0 at 8 s |
+| Median latency | 30% | Linear to 0 at 8 s; unmeasured latency earns no credit |
 | Cancellation rate | 20% | Timeouts and client cancellations |
-
-Verdicts: `healthy` (≥95% success, <3 s median) · `mixed` · `unreliable`
-(≥30% cancelled) · `quota_blocked` (all 429) · `dead` (all 404) · `stale`
-(not probed in the last 6 h — the evidence is too old to route on, so the
-model is never recommended) · `untested`.
 
 History is kept per model (newest 200 probes) in `history.json`, so rankings
 improve as you use it.
@@ -194,7 +213,12 @@ The server doubles as a command-line tool:
 ```bash
 python3 modellens.py --config config.json --data history.json --once probe --limit 20
 python3 modellens.py --config config.json --data history.json --once ranking
+python3 modellens.py --once recommend --profile fast
 ```
+
+`--once` accepts the tool arguments as flags: `--limit N`, `--workers N`,
+`--contains S`, `--model M`, `--endpoint E`, `--check-tools`, `--no-stream`,
+`--profile P`, `--all`. Without `--once` the server speaks MCP over stdio.
 
 ---
 
@@ -246,6 +270,10 @@ MIT. Use it, ship it, charge for your own hosted version.
   then latency and says so — true per-token cost is not collected.
 - **Probing is sequential by default.** `workers>1` is faster, but concurrent
   probes can self-induce 429s that misread a model's real quality.
+- **HTTP 200 is not success.** Gateways often return 200 with `{"error": ...}`,
+  empty `choices`, or an HTML page. Those are recorded as failures (with the
+  transport reason, e.g. `timeout` / `dns_error`), because a status code alone
+  would make a broken model look healthy.
 - **`ranking`/`recommend`/`report` are read-only but not offline.** They GET
   each endpoint's `/models` list live (no inference, no token cost).
 
@@ -259,16 +287,20 @@ python -m unittest discover -s tests -v
 ```
 
 `tests/test_modellens.py` covers scoring, verdicts, p95, the history store,
-recommendations, discovery/pricing parsing, and the MCP wire protocol. CI runs
-the same suite on Python 3.9 and 3.12 on every push and PR.
+recommendations, discovery/pricing parsing, response validation, the streaming
+probe, argument parsing and the MCP wire protocol; `tests/test_server_x402.py`
+exercises the hosted server over real HTTP and proves the payment ordering
+(verify → execute → settle). CI runs the same suite on Python 3.9 and 3.12 on
+every push and PR.
 
 The hosted Cloudflare Worker (`worker/`) serves the read-only tools from KV; its
 scoring is kept in lock-step with `modellens.py` (median latency, cancellation =
-status 0/499, score 0 on 0% success, same verdicts). `worker/test/scoring.test.mjs`
-pins this — run `node --test test/scoring.test.mjs` in `worker/` (plain
-`node --test test/` does not resolve the directory on Node 24). Deploying the worker requires
-`wrangler secret put INGEST_SECRET`; the secret is not committed (and any value
-previously committed must be rotated).
+status 0/499, score 0 on 0% success, same verdicts including `auth_error` /
+`failing`, grouping per endpoint+model). `worker/test/scoring.test.mjs` pins the
+scoring and `worker/test/http.test.mjs` the HTTP layer (CORS, error hygiene,
+ingest auth, payment ordering). Run `node --test` in `worker/`. Deploying
+the worker requires `wrangler secret put INGEST_SECRET`; the secret is not
+committed (and any value previously committed must be rotated).
 
 ## Hosted / paid
 

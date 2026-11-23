@@ -31,7 +31,11 @@ import calendar
 import json
 import math
 import os
+import socket
+import ssl
 import sys
+import tempfile
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -39,7 +43,7 @@ from statistics import median
 
 PROTOCOL_VERSION = "2024-11-05"
 SERVER_NAME = "modellens"
-SERVER_VERSION = "0.1.5"
+SERVER_VERSION = "0.1.6"
 
 # How hard a probe pushes a model: enough to expose broken routing, cheap enough
 # to run often. A probe is a real request, so it costs a few tokens.
@@ -47,6 +51,10 @@ PROBE_PROMPT = "Reply with exactly: OK"
 PROBE_MAX_TOKENS = 512
 PROBE_TIMEOUT = 90
 PROBE_WORKERS_DEFAULT = 1  # sequential by default: concurrent probes can self-induce 429s
+PROBE_WORKERS_MAX = 16     # hard ceiling: workers=500 would be a thread storm
+PROBE_MAX_LIMIT = 200      # ceiling for probe limit; a negative would slice backwards
+RANKING_DEFAULT_LIMIT = 20
+LIST_MODELS_MAX_LIMIT = 1000
 
 # Scoring weights for the 0-100 quality score.
 W_SUCCESS = 50.0
@@ -63,22 +71,54 @@ STALE_AFTER_HOURS = 6.0  # evidence older than this is too old to route on:
 # HTTP
 # --------------------------------------------------------------------------
 
+def _classify_network_error(exc: Exception) -> tuple[str, str]:
+    """Map a network exception to (error_type, message) for the history row.
+
+    urllib wraps most transport failures in URLError with a .reason; the
+    concrete reason class says *why* the request died (timeout vs refused vs
+    DNS vs TLS), so history records the cause instead of a bare "status 0".
+    """
+    reason = getattr(exc, "reason", None)
+    if reason is None:
+        reason = exc
+    msg = str(reason) or str(exc)
+    if isinstance(reason, (socket.timeout, TimeoutError)) or "timed out" in msg.lower():
+        return "timeout", msg
+    if isinstance(reason, ConnectionRefusedError):
+        return "conn_refused", msg
+    if isinstance(reason, ConnectionResetError):
+        return "conn_reset", msg
+    if isinstance(reason, ConnectionError):
+        return "conn_error", msg
+    if isinstance(reason, socket.gaierror):
+        return "dns_error", msg
+    if isinstance(reason, ssl.SSLError):
+        return "ssl_error", msg
+    return "network_error", msg
+
+
+def _network_error_body(exc: Exception) -> dict:
+    """Body shape returned when a transport-level error swallowed the request."""
+    etype, msg = _classify_network_error(exc)
+    return {"__error__": {"type": etype, "message": msg[:300]}}
+
+
 def _post(url: str, payload: dict, timeout: float, headers: dict | None = None) -> tuple[int, dict, float]:
     body = json.dumps(payload).encode()
     hdrs = {"Content-Type": "application/json", "Accept": "application/json"}
     if headers:
         hdrs.update(headers)
     req = urllib.request.Request(url, data=body, headers=hdrs, method="POST")
-    started = time.time()
+    started = time.monotonic()  # monotonic: NTP jumps must not make latency negative
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             raw = resp.read().decode("utf-8", errors="replace")
-            return resp.status, _maybe_json(raw), (time.time() - started) * 1000.0
+            return resp.status, _maybe_json(raw), (time.monotonic() - started) * 1000.0
     except urllib.error.HTTPError as exc:
         raw = exc.read().decode("utf-8", errors="replace")
-        return exc.code, _maybe_json(raw), (time.time() - started) * 1000.0
-    except Exception:
-        return 0, {}, (time.time() - started) * 1000.0
+        return exc.code, _maybe_json(raw), (time.monotonic() - started) * 1000.0
+    except Exception as exc:
+        return 0, _network_error_body(exc), (time.monotonic() - started) * 1000.0
 
 
 def _get(url: str, timeout: float, headers: dict | None = None) -> tuple[int, dict, float]:
@@ -86,16 +126,16 @@ def _get(url: str, timeout: float, headers: dict | None = None) -> tuple[int, di
     if headers:
         hdrs.update(headers)
     req = urllib.request.Request(url, headers=hdrs, method="GET")
-    started = time.time()
+    started = time.monotonic()
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             raw = resp.read().decode("utf-8", errors="replace")
-            return resp.status, _maybe_json(raw), (time.time() - started) * 1000.0
+            return resp.status, _maybe_json(raw), (time.monotonic() - started) * 1000.0
     except urllib.error.HTTPError as exc:
         raw = exc.read().decode("utf-8", errors="replace")
-        return exc.code, _maybe_json(raw), (time.time() - started) * 1000.0
-    except Exception:
-        return 0, {}, (time.time() - started) * 1000.0
+        return exc.code, _maybe_json(raw), (time.monotonic() - started) * 1000.0
+    except Exception as exc:
+        return 0, _network_error_body(exc), (time.monotonic() - started) * 1000.0
 
 
 def _maybe_json(raw: str):
@@ -187,6 +227,186 @@ def discover_models(ep: Endpoint) -> list[str]:
 # Probing
 # --------------------------------------------------------------------------
 
+def _parse_bool(val, default: bool = False) -> bool:
+    """Booleans as MCP clients actually send them.
+
+    The tool schema declares strings, so clients pass true / "true" / "1" /
+    "false" / "0". bool("false") is True in Python — parse explicitly instead.
+    Unknown strings fall back to the default.
+    """
+    if val is None or val == "":
+        return default
+    if isinstance(val, bool):
+        return val
+    if isinstance(val, (int, float)):
+        return bool(val)
+    s = str(val).strip().lower()
+    if s in ("1", "true", "yes", "y", "on"):
+        return True
+    if s in ("0", "false", "no", "n", "off"):
+        return False
+    return default
+
+
+def _clamp_int(val, default: int, lo: int, hi: int) -> int:
+    """Coerce a tool argument to an int clamped to [lo, hi].
+
+    -5 would become a Python negative slice and 50000 workers a thread storm,
+    so both clamp; unparseable values (None, "", "abc") fall back to default.
+    """
+    try:
+        n = int(val)
+    except (TypeError, ValueError):
+        return default
+    return max(lo, min(hi, n))
+
+
+def _is_valid_chat_response(body) -> tuple[bool, str]:
+    """Strictly validate an OpenAI-compatible chat response.
+
+    HTTP 200 lies in three common ways: gateways (OneAPI/NewAPI/OpenRouter)
+    wrap an upstream error as {"error": ...} with status 200, they return
+    choices: [], and non-JSON pages (502 HTML, empty bodies) come back wrapped
+    as {"raw": ...} by _maybe_json — which isinstance(body, dict) would accept.
+    """
+    if not isinstance(body, dict):
+        return False, "non_json"
+    if "error" in body and body["error"]:
+        return False, "body_error"
+    if set(body.keys()) == {"raw"} or not body:
+        return False, "non_json_raw"
+    choices = body.get("choices")
+    if not isinstance(choices, list) or not choices:
+        return False, "empty_choices"
+    first = choices[0] or {}
+    if first.get("finish_reason") == "error":
+        return False, "finish_error"
+    msg = first.get("message") or {}
+    has_payload = bool(
+        (isinstance(msg.get("content"), str) and msg["content"].strip())
+        or (isinstance(msg.get("reasoning_content"), str) and msg["reasoning_content"].strip())
+        or msg.get("tool_calls")
+    )
+    return (True, "") if has_payload else (False, "empty_content")
+
+
+def _failure_message(status: int, body, reason: str) -> tuple[str, str | None]:
+    """Human error text + transport error_type for a failed probe."""
+    if isinstance(body, dict):
+        net = body.get("__error__")
+        if isinstance(net, dict):
+            return (f"{net.get('type')}: {net.get('message')}")[:300], str(net.get("type"))
+        err = body.get("error")
+        if isinstance(err, dict):
+            m = str(err.get("message") or err.get("code") or "")
+            if m:
+                return m[:300], None
+        elif err:
+            return str(err)[:300], None
+    if status == 200:
+        return f"HTTP 200 without a valid completion ({reason or 'invalid body'})", None
+    return f"HTTP {status}", None
+
+
+def _open_stream(ep: Endpoint, model: str):
+    """Open a stream:true chat completion. Returns (status, resp|None, ms, err).
+
+    err is None on success; on failure it is {"type": ..., "message": ...} or a
+    short text. Separated from the SSE loop so tests can stub the transport.
+    """
+    payload = {"model": model,
+               "messages": [{"role": "user", "content": PROBE_PROMPT}],
+               "max_tokens": 32,
+               "stream": True}
+    req = urllib.request.Request(
+        ep.chat_url, data=json.dumps(payload).encode("utf-8"),
+        headers={**ep.headers(), "Content-Type": "application/json",
+                 "Accept": "text/event-stream"},
+        method="POST")
+    started = time.monotonic()
+    try:
+        resp = urllib.request.urlopen(req, timeout=PROBE_TIMEOUT)
+        return resp.status, resp, (time.monotonic() - started) * 1000.0, None
+    except urllib.error.HTTPError as exc:
+        try:
+            raw = exc.read().decode("utf-8", errors="replace")[:200]
+        except Exception:
+            raw = ""
+        return exc.code, None, (time.monotonic() - started) * 1000.0, raw or f"HTTP {exc.code}"
+    except Exception as exc:
+        etype, msg = _classify_network_error(exc)
+        return 0, None, (time.monotonic() - started) * 1000.0, {"type": etype, "message": msg}
+
+
+def _probe_stream_sse(ep: Endpoint, model: str) -> dict:
+    """Streaming probe: validate SSE blocks, measure TTFT and total latency.
+
+    stream_ok means HTTP 200 AND at least one delta chunk carrying real output
+    AND no error block inside the stream. Reading stops after a few valid token
+    chunks — enough to prove the stream works without burning more tokens.
+    """
+    out = {"ok": False, "status": 0, "ttft_ms": None, "latency_ms": None, "error": None}
+    status, resp, open_ms, err = _open_stream(ep, model)
+    out["status"] = status
+    if resp is None:
+        out["latency_ms"] = round(open_ms, 1)
+        if isinstance(err, dict):
+            out["error"] = f"{err.get('type')}: {err.get('message')}"[:300]
+        else:
+            out["error"] = str(err or f"HTTP {status}")[:300]
+        return out
+    t0 = time.monotonic()
+    ttft_ms = None
+    chunks = 0
+    try:
+        for raw_line in resp:
+            line = raw_line.decode("utf-8", errors="replace").strip()
+            if not line.startswith("data:"):
+                continue
+            data_str = line[5:].strip()
+            if data_str == "[DONE]":
+                break
+            try:
+                ev = json.loads(data_str)
+            except ValueError:
+                continue
+            if isinstance(ev, dict) and ev.get("error"):
+                e = ev["error"]
+                out["error"] = ((e.get("message") if isinstance(e, dict) else str(e))
+                                or "stream error")[:200]
+                break
+            choices = ev.get("choices") if isinstance(ev, dict) else None
+            delta = (choices[0].get("delta")
+                     if isinstance(choices, list) and choices
+                     and isinstance(choices[0], dict) else None) or {}
+            content = delta.get("content")
+            reasoning = delta.get("reasoning_content")
+            has_token = ((isinstance(content, str) and content.strip())
+                         or (isinstance(reasoning, str) and reasoning.strip())
+                         or delta.get("tool_calls"))
+            if has_token:
+                if ttft_ms is None:
+                    ttft_ms = (time.monotonic() - t0) * 1000.0
+                chunks += 1
+                if chunks >= 4:  # a few valid tokens prove the stream is healthy
+                    break
+        out["latency_ms"] = round(open_ms + (time.monotonic() - t0) * 1000.0, 1)
+        if chunks > 0:
+            out["ok"] = True
+            out["ttft_ms"] = round(ttft_ms, 1)
+        elif not out["error"]:
+            out["error"] = "no token chunk received (gateway may not stream)"
+    except Exception as exc:
+        etype, _ = _classify_network_error(exc)
+        out["error"] = f"stream aborted ({etype})"
+    finally:
+        try:
+            resp.close()
+        except Exception:
+            pass
+    return out
+
+
 def probe_model(ep: Endpoint, model: str, check_stream: bool = True) -> dict:
     """Run one real request. Cancelled/failed/timeout are all recorded."""
     out: dict = {
@@ -198,6 +418,7 @@ def probe_model(ep: Endpoint, model: str, check_stream: bool = True) -> dict:
         "stream_ok": None,
         "tools_ok": None,
         "error": None,
+        "error_type": None,
         "probed_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
     }
 
@@ -213,33 +434,23 @@ def probe_model(ep: Endpoint, model: str, check_stream: bool = True) -> dict:
     out["status"] = status
     out["latency_ms"] = round(ms, 1)
 
-    if status == 200 and isinstance(body, dict):
+    valid, reason = _is_valid_chat_response(body)
+    if status == 200 and valid:
         out["ok"] = True
-        choice = (body.get("choices") or [{}])[0]
-        msg = choice.get("message") or {}
+        msg = body["choices"][0].get("message") or {}
         content = msg.get("content")
         out["reply"] = (content or "")[:80] if isinstance(content, str) else None
     else:
-        msg = ""
-        if isinstance(body, dict):
-            err = body.get("error")
-            if isinstance(err, dict):
-                msg = str(err.get("message") or err.get("code") or "")
-            elif err:
-                msg = str(err)
-        out["error"] = (msg or f"HTTP {status}")[:300]
+        text, etype = _failure_message(status, body, reason)
+        out["error"] = text
+        out["error_type"] = etype
 
     if check_stream and out["ok"]:
-        s_status, s_body, _ = _post(
-            ep.chat_url,
-            {"model": model,
-             "messages": [{"role": "user", "content": PROBE_PROMPT}],
-             "max_tokens": 32,
-             "stream": True},
-            timeout=PROBE_TIMEOUT,
-            headers=ep.headers(),
-        )
-        out["stream_ok"] = s_status == 200
+        sres = _probe_stream_sse(ep, model)
+        out["stream_ok"] = sres["ok"]
+        out["ttft_ms"] = sres["ttft_ms"]
+        if not sres["ok"]:
+            out["stream_error"] = sres["error"]
 
     return out
 
@@ -267,10 +478,12 @@ def probe_tools(ep: Endpoint, model: str) -> bool | None:
         timeout=PROBE_TIMEOUT,
         headers=ep.headers(),
     )
-    if status != 200 or not isinstance(body, dict):
+    if status != 200:
         return None
-    choice = (body.get("choices") or [{}])[0]
-    msg = choice.get("message") or {}
+    valid, _reason = _is_valid_chat_response(body)
+    if not valid:
+        return None
+    msg = body["choices"][0].get("message") or {}
     calls = msg.get("tool_calls") or []
     return any(c.get("function", {}).get("name") == "modellens_ping" for c in calls)
 
@@ -280,12 +493,19 @@ def probe_tools(ep: Endpoint, model: str) -> bool | None:
 # --------------------------------------------------------------------------
 
 class Store:
-    """Append-only JSON store of probe results, bounded to the last N per model."""
+    """Append-only JSON store of probe results, bounded to the last N per model.
+
+    Thread-safe: the hosted x402 server shares one Store across the request
+    threads of a ThreadingHTTPServer, so add/save/for_model take a lock, and
+    save() writes through a UNIQUE temp file (a fixed ".tmp" name races two
+    concurrent saves: one os.replace() moves a half-written or deleted file).
+    """
 
     def __init__(self, path: str, keep: int = 200):
         self.path = path
         self.keep = keep
         self.rows: list[dict] = []
+        self._lock = threading.RLock()
         self._load()
 
     def _load(self) -> None:
@@ -302,32 +522,72 @@ class Store:
             self.rows = []
 
     def add(self, rows: list[dict]) -> None:
-        self.rows.extend(rows)
-        # Bound memory: keep the most recent N per (endpoint, model).
-        seen: dict[str, list[dict]] = {}
-        for row in reversed(self.rows):
+        with self._lock:
+            self.rows.extend(rows)
+            self._trim()
+
+    def _trim(self) -> None:
+        """Keep the newest `keep` rows per (endpoint, model), preserving order.
+
+        Selected by POSITION, not by re-sorting on probed_at: rows without a
+        timestamp (imported history, rows pushed by the worker, hand-edited
+        files) all compare equal, so sorting a newest-first bucket left the
+        bucket permanently in reverse and every later trim evicted the middle
+        of the history — 10 rows with keep=2 collapsed to [newest, oldest].
+        """
+        keep_idx: dict[str, list[int]] = {}
+        for idx in range(len(self.rows) - 1, -1, -1):
+            row = self.rows[idx]
             key = f"{row.get('endpoint')}/{row.get('model')}"
-            bucket = seen.setdefault(key, [])
+            bucket = keep_idx.setdefault(key, [])
             if len(bucket) < self.keep:
-                bucket.append(row)
-        kept = []
-        for bucket in seen.values():
-            kept.extend(bucket)
-        kept.sort(key=lambda r: r.get("probed_at") or "")
-        self.rows = kept
+                bucket.append(idx)
+        kept = {i for bucket in keep_idx.values() for i in bucket}
+        if len(kept) != len(self.rows):
+            self.rows = [r for i, r in enumerate(self.rows) if i in kept]
 
     def save(self) -> None:
         if not self.path:
             return
-        os.makedirs(os.path.dirname(os.path.abspath(self.path)), exist_ok=True)
-        tmp = self.path + ".tmp"
-        with open(tmp, "w", encoding="utf-8") as fh:
-            json.dump({"version": 1, "rows": self.rows}, fh, ensure_ascii=False)
-        os.replace(tmp, self.path)
+        with self._lock:
+            d = os.path.dirname(os.path.abspath(self.path))
+            os.makedirs(d, exist_ok=True)
+            fd, tmp = tempfile.mkstemp(prefix=".modellens-", suffix=".tmp", dir=d)
+            try:
+                with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                    json.dump({"version": 1, "rows": self.rows}, fh, ensure_ascii=False)
+                self._replace(tmp, self.path)
+            except Exception:
+                try:
+                    os.unlink(tmp)
+                except OSError:
+                    pass
+                raise
+
+    @staticmethod
+    def _replace(tmp: str, path: str, attempts: int = 20) -> None:
+        """os.replace with a short retry.
+
+        On POSIX the rename is atomic and never fails this way. On Windows,
+        replacing a file another thread is mid-read of raises PermissionError
+        (open handles do not allow delete-sharing), and an antivirus/indexer
+        can hold the file for a few milliseconds. Retrying converges because
+        both readers and the writer are this same process.
+        """
+        last = None
+        for _ in range(attempts):
+            try:
+                os.replace(tmp, path)
+                return
+            except PermissionError as exc:  # Windows-only race; benign
+                last = exc
+                time.sleep(0.01)
+        raise last if last else OSError(f"could not replace {path}")
 
     def for_model(self, endpoint: str, model: str) -> list[dict]:
-        return [r for r in self.rows
-                if r.get("endpoint") == endpoint and r.get("model") == model]
+        with self._lock:
+            return [r for r in self.rows
+                    if r.get("endpoint") == endpoint and r.get("model") == model]
 
 
 # --------------------------------------------------------------------------
@@ -349,11 +609,16 @@ def _parse_ts(value) -> float | None:
 
 
 def _format_age(age_hours: float | None) -> str:
-    """Short human age for a table column: '12m' / '3h' / '2d' / '-'."""
+    """Short human age for a table column: '12m' / '3h' / '2d' / '-'.
+
+    Takes raw (unrounded) hours so minutes land on real minutes, not on the
+    6-minute grid a pre-rounded 0.1h value would impose (1m/6m/12m/...).
+    """
     if age_hours is None:
         return "-"
-    if age_hours < 1:
-        return f"{max(1, round(age_hours * 60))}m"
+    minutes = age_hours * 60.0
+    if minutes < 60:
+        return f"{max(1, round(minutes))}m"
     if age_hours < 48:
         return f"{age_hours:.0f}h"
     return f"{age_hours / 24:.0f}d"
@@ -366,19 +631,23 @@ def score_model(rows: list[dict], now: float | None = None) -> dict:
     oks = [r for r in rows if r.get("ok")]
     failures = attempts - len(oks)
     cancelled = len([r for r in rows if not r.get("ok") and r.get("status") in (0, 499)])
-    latencies = [r["latency_ms"] for r in oks if isinstance(r.get("latency_ms"), (int, float))]
+    # bool is an int subclass: a latency_ms of True would corrupt the median.
+    latencies = [r["latency_ms"] for r in oks
+                 if isinstance(r["latency_ms"], (int, float))
+                 and not isinstance(r["latency_ms"], bool)]
 
     success_rate = (len(oks) / attempts * 100.0) if attempts else 0.0
     cancel_rate = (cancelled / attempts * 100.0) if attempts else 0.0
     med = median(latencies) if latencies else None
 
-    # Freshness of the evidence: the newest probe in these rows.
+    # Freshness of the evidence: the newest probe in these rows. Raw seconds —
+    # do NOT round first, or _format_age can only ever show 6-minute steps.
     last_ts = None
     for r in rows:
         ts = _parse_ts(r.get("probed_at"))
         if ts is not None and (last_ts is None or ts > last_ts):
             last_ts = ts
-    age_hours = (round(max(0.0, now - last_ts) / 3600.0, 1)
+    age_hours = (max(0.0, now - last_ts) / 3600.0
                  if last_ts is not None else None)
     last_probed_at = (time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(last_ts))
                       if last_ts is not None else None)
@@ -389,18 +658,23 @@ def score_model(rows: list[dict], now: float | None = None) -> dict:
         verdict = "dead"
     elif success_rate == 0 and all(r.get("status") == 429 for r in rows):
         verdict = "quota_blocked"
+    elif success_rate == 0 and all(r.get("status") in (401, 403) for r in rows):
+        verdict = "auth_error"  # a key/permission problem, not a flaky model
     elif cancel_rate >= 30:
         verdict = "unreliable"
-    elif success_rate >= 95 and (med or 9e9) < 3000:
-        verdict = "healthy"
+    elif success_rate >= 95 and med is not None and med < 3000:
+        verdict = "healthy"  # med == 0 must read as fast, and None as unmeasured
+    elif success_rate == 0:
+        verdict = "failing"  # real failures (500/502/503/timeout), not mixed health
     else:
         verdict = "mixed"
 
     if (attempts and success_rate > 0 and verdict in ("healthy", "mixed")
             and age_hours is not None and age_hours > STALE_AFTER_HOURS):
         # Old evidence is not bad evidence — it is no evidence about *now*.
-        # Failure verdicts (dead/quota_blocked/unreliable) are kept: they say
-        # what the last probe found, and the age column says how long ago.
+        # Failure verdicts (dead/quota_blocked/auth_error/unreliable/failing)
+        # are kept: they say what the last probe found, and the age column
+        # says how long ago.
         verdict = "stale"
 
     if attempts == 0 or success_rate == 0:
@@ -415,7 +689,10 @@ def score_model(rows: list[dict], now: float | None = None) -> dict:
             "last_probed_at": last_probed_at, "age_hours": age_hours,
         }
 
-    latency_score = max(0.0, min(1.0, 1.0 - (med / LATENCY_REFERENCE_MS))) * 100.0
+    # Unknown latency (ok rows with no latency recorded) earns no latency
+    # credit — honest, and it also keeps None out of the arithmetic.
+    latency_score = (0.0 if med is None
+                     else max(0.0, min(1.0, 1.0 - (med / LATENCY_REFERENCE_MS))) * 100.0)
     score = (success_rate * W_SUCCESS + latency_score * W_LATENCY
              + max(0.0, 100.0 - cancel_rate * 2.0) * W_CANCEL) / (
         W_SUCCESS + W_LATENCY + W_CANCEL)
@@ -474,7 +751,9 @@ def _zero_priced(row: dict) -> bool:
 def recommend(ranking: list[dict], profile: str) -> dict:
     profile = (profile or "capable").lower()
     usable = [r for r in ranking
-              if r["score"] > 0 and r["verdict"] not in ("dead", "quota_blocked", "stale")]
+              if r["score"] > 0
+              and r["verdict"] not in ("dead", "quota_blocked", "auth_error",
+                                       "failing", "stale")]
     note = None
     criteria = PROFILE_HINTS.get(profile, PROFILE_HINTS["capable"])
     if not usable:
@@ -550,7 +829,7 @@ def load_config(path: str) -> list[Endpoint]:
 
 def tool_list_models(ctx: Context, args: dict) -> str:
     pattern = (args.get("contains") or "").strip().lower()
-    limit = int(args.get("limit") or 0)
+    limit = _clamp_int(args.get("limit"), 0, 0, LIST_MODELS_MAX_LIMIT)
     lines = []
     for ep in ctx.endpoints:
         if not ep.enabled:
@@ -567,13 +846,19 @@ def tool_list_models(ctx: Context, args: dict) -> str:
     return "\n".join(lines).rstrip()
 
 
-def _probe_one(ep: Endpoint, model: str, check_tools: bool) -> dict:
-    row = probe_model(ep, model)
+def _probe_one(ep: Endpoint, model: str, check_tools: bool, check_stream: bool = True) -> dict:
+    row = probe_model(ep, model, check_stream=check_stream)
     if check_tools and row["ok"]:
         row["tools_ok"] = probe_tools(ep, model)
     mark = "ok" if row["ok"] else f"FAIL({row['status']})"
     extra = f" tools={'yes' if row.get('tools_ok') else 'no'}" if check_tools else ""
-    print(f"  {ep.name}/{model}: {mark} {row['latency_ms']}ms{extra}", file=sys.stderr)
+    stream_extra = ""
+    if row.get("stream_ok") is not None:
+        stream_extra = f" stream={'yes' if row['stream_ok'] else 'no'}"
+        if row.get("ttft_ms") is not None:
+            stream_extra += f" ttft={row['ttft_ms']:.0f}ms"
+    print(f"  {ep.name}/{model}: {mark} {row['latency_ms']}ms{stream_extra}{extra}",
+          file=sys.stderr)
     return row
 
 
@@ -581,9 +866,10 @@ def tool_probe(ctx: Context, args: dict) -> str:
     endpoint = (args.get("endpoint") or "").strip()
     model = (args.get("model") or "").strip()
     contains = (args.get("contains") or "").strip().lower()
-    limit = int(args.get("limit") or 20)
-    check_tools = bool(args.get("check_tools"))
-    workers = max(1, int(args.get("workers") or PROBE_WORKERS_DEFAULT))
+    limit = _clamp_int(args.get("limit"), 20, 1, PROBE_MAX_LIMIT)
+    check_tools = _parse_bool(args.get("check_tools"))
+    check_stream = _parse_bool(args.get("check_stream"), default=True)
+    workers = _clamp_int(args.get("workers"), PROBE_WORKERS_DEFAULT, 1, PROBE_WORKERS_MAX)
 
     targets: list[tuple[Endpoint, str]] = []
     for ep in ctx.endpoints:
@@ -604,20 +890,24 @@ def tool_probe(ctx: Context, args: dict) -> str:
     if workers > 1:
         from concurrent.futures import ThreadPoolExecutor
         with ThreadPoolExecutor(max_workers=workers) as ex:
-            results = list(ex.map(lambda t: _probe_one(t[0], t[1], check_tools), targets))
+            results = list(ex.map(
+                lambda t: _probe_one(t[0], t[1], check_tools, check_stream), targets))
     else:
-        results = [_probe_one(ep, m, check_tools) for ep, m in targets]
+        results = [_probe_one(ep, m, check_tools, check_stream) for ep, m in targets]
 
     ctx.store.add(results)
     ctx.store.save()
 
     ok = sum(1 for r in results if r["ok"])
     lines = [f"Probed {len(results)} models: {ok} ok, {len(results) - ok} failed.", ""]
-    for r in sorted(results, key=lambda x: (not x["ok"], x["latency_ms"] or 1e12)):
+    for r in sorted(results, key=lambda x: (not x["ok"],
+                                            x["latency_ms"] if x["latency_ms"] is not None else 1e12)):
         line = f"- {r['endpoint']}/{r['model']}: " + (
             f"ok {r['latency_ms']}ms" if r["ok"] else f"FAIL http={r['status']} {r['error']}")
         if r.get("stream_ok") is not None:
             line += f" stream={'yes' if r['stream_ok'] else 'no'}"
+            if r.get("ttft_ms") is not None:
+                line += f" ttft={r['ttft_ms']:.0f}ms"
         if r.get("tools_ok") is not None:
             line += f" tools={'yes' if r['tools_ok'] else 'no'}"
         lines.append(line)
@@ -628,8 +918,8 @@ def tool_ranking(ctx: Context, args: dict) -> str:
     ranking = build_ranking(ctx.store, ctx.endpoints)
     if not ranking:
         return "No models discovered. Run probe first."
-    limit = int(args.get("limit") or 20)
-    show_all = str(args.get("all", "")).lower() in ("1", "true", "yes")
+    limit = _clamp_int(args.get("limit"), RANKING_DEFAULT_LIMIT, 1, 200)
+    show_all = _parse_bool(args.get("all"))
 
     tested = [r for r in ranking if r["attempts"] > 0]
     untested = [r for r in ranking if r["attempts"] == 0]
@@ -688,7 +978,8 @@ def tool_report(ctx: Context, args: dict) -> str:
     lines.append(f"- probes recorded: {len(ctx.store.rows)}")
     lines.append("")
     lines.append("## Verdicts")
-    for k in ("healthy", "mixed", "unreliable", "quota_blocked", "dead", "stale", "untested"):
+    for k in ("healthy", "mixed", "unreliable", "quota_blocked",
+              "auth_error", "failing", "dead", "stale", "untested"):
         if verdicts.get(k):
             lines.append(f"- {k}: {verdicts[k]}")
     lines.append("")
@@ -724,6 +1015,7 @@ TOOLS = [
       "contains": "substring filter on model id",
       "limit": "max models to probe (default 20)",
       "check_tools": "also test function calling (slower)",
+      "check_stream": "also test streaming and measure time-to-first-token (default on)",
       "workers": "parallel probe workers (default 1 = sequential; >1 is faster but "
                  "can self-induce 429s that misread model quality)"},
      tool_probe),
@@ -733,7 +1025,8 @@ TOOLS = [
      "probes, no token cost). Ordered best-first by score = success 50% + median latency 30% + "
      "cancellation 20%. Use after probe to see the ranked table; use recommend for a routing "
      "pick. Rows include model, score, success%, cancel%, median latency, verdict.",
-     {"limit": "rows to show (default 30)"},
+     {"limit": "rows to show (default 20)",
+      "all": "also list untested models (true/false)"},
      tool_ranking),
     ("recommend",
      "Return the best model(s) for a task profile: 'fast' (lowest latency among models with "
@@ -774,7 +1067,12 @@ TOOL_ANNOTATIONS = {
 # MCP server (stdio, newline-delimited JSON-RPC)
 # --------------------------------------------------------------------------
 
-def handle(ctx: Context, msg: dict) -> dict | None:
+def handle(ctx: Context, msg) -> dict | None:
+    if not isinstance(msg, dict):
+        # Valid JSON but not an object (array, string, number): there is no
+        # method to dispatch. Without this guard, msg.get("id") below raises
+        # AttributeError and the stdio server dies on a stray "[]".
+        return err(None, -32600, "invalid request: JSON-RPC message must be an object")
     method = msg.get("method")
     msg_id = msg.get("id")
 
@@ -803,9 +1101,15 @@ def handle(ctx: Context, msg: dict) -> dict | None:
             for n, d, spec, _ in TOOLS
         ]})
     if method == "tools/call":
-        params = msg.get("params") or {}
+        params = msg.get("params")
+        if not isinstance(params, dict):
+            params = {}
         name = params.get("name")
-        args = params.get("arguments") or {}
+        if not isinstance(name, str):
+            return err(msg_id, -32602, "missing tool name")
+        args = params.get("arguments")
+        if not isinstance(args, dict):
+            args = {}
         for n, _, _, fn in TOOLS:
             if n == name:
                 try:
@@ -845,7 +1149,9 @@ def serve(ctx: Context) -> int:
         try:
             resp = handle(ctx, msg)
         except Exception as exc:
-            resp = err(msg.get("id"), -32603, f"internal error: {exc}")
+            # handle() rejects non-object messages itself, so this is a last
+            # resort; err(None, ...) is safe whatever the line contained.
+            resp = err(None, -32603, f"internal error: {exc}")
         if resp is not None:
             sys.stdout.write(json.dumps(resp, ensure_ascii=False) + "\n")
             sys.stdout.flush()
@@ -873,6 +1179,22 @@ def main() -> int:
     ap.add_argument("--once", metavar="TOOL",
                     help="run one tool against the CLI and exit "
                          f"({', '.join(n for n, _, _, _ in TOOLS)})")
+    # Arguments for --once. The README has documented `--once probe --limit 20`
+    # since the first release while argparse rejected it, so the advertised
+    # command failed with "unrecognized arguments".
+    ap.add_argument("--limit", metavar="N", help="max models / rows (tool default applies)")
+    ap.add_argument("--workers", metavar="N",
+                    help=f"parallel probe workers (1-{PROBE_WORKERS_MAX}, default 1)")
+    ap.add_argument("--contains", metavar="S", help="substring filter on model id")
+    ap.add_argument("--model", metavar="M", help="probe exactly this model id")
+    ap.add_argument("--endpoint", metavar="E", help="restrict to one endpoint name")
+    ap.add_argument("--check-tools", action="store_true", help="also test function calling")
+    ap.add_argument("--no-stream", action="store_true",
+                    help="skip the streaming/TTFT probe")
+    ap.add_argument("--profile", metavar="P",
+                    help="recommend profile: fast | cheap | capable")
+    ap.add_argument("--all", action="store_true",
+                    help="ranking: also list untested models")
     args = ap.parse_args()
 
     if args.config and not os.path.exists(args.config):
@@ -882,7 +1204,18 @@ def main() -> int:
         sys.stderr.write("modellens: no endpoints configured; "
                          "write config.json or set MODELLENS_CONFIG\n")
     if args.once:
-        return run_once(ctx, args.once, {})
+        tool_args: dict = {}
+        for key in ("limit", "workers", "contains", "model", "endpoint", "profile"):
+            val = getattr(args, key)
+            if val is not None:
+                tool_args[key] = val
+        if args.check_tools:
+            tool_args["check_tools"] = True
+        if args.no_stream:
+            tool_args["check_stream"] = False
+        if args.all:
+            tool_args["all"] = True
+        return run_once(ctx, args.once, tool_args)
     return serve(ctx)
 
 

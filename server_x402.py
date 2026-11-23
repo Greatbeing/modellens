@@ -12,10 +12,20 @@ X-PAYMENT; the server verifies+settles via the facilitator, then runs the tool.
 
 Env:
   MODELLENS_CONFIG, MODELLENS_DATA   endpoint config / history (like CLI)
-  X402_PAY_TO                        receiving EVM address (Base)
+  X402_PAY_TO                        receiving EVM address (Base) — REQUIRED:
+                                     the server refuses to start without it, so
+                                     a self-host never silently pays out to a
+                                     hardcoded default address.
   X402_FACILITATOR                   default https://x402.org/facilitator
   X402_PORT                          default 8765
+  X402_MAX_PROBE_LIMIT               server-side cap on probe limit (default 20)
+  X402_MAX_PROBE_WORKERS             server-side cap on probe workers (default 4)
   PRICES in atomic USDC (6 dec): probe=50000 ranking=10000 recommend=10000 report=20000; list_models free
+
+Payment flow (two-phase, on purpose): /verify (signature check, no money
+moves) -> run the tool -> /settle only after the tool succeeded. Settling
+before execution would charge the caller on-chain for a call that may still
+fail (bad args, unknown model, upstream 5xx) with no refund path.
 """
 from __future__ import annotations
 
@@ -31,9 +41,23 @@ import modellens as ml  # noqa: E402
 
 USDC_BASE = "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"  # USDC on Base
 NETWORK = "eip155:8453"  # Base mainnet
-PAY_TO = os.environ.get("X402_PAY_TO", "0x2aB8D0071b8D9d3Ac194ba10a3f8767522920d50")
+PAY_TO = os.environ.get("X402_PAY_TO", "").strip()
+if not PAY_TO:
+    sys.stderr.write(
+        "server_x402: refusing to start — X402_PAY_TO is not set.\n"
+        "  Payments would otherwise go to a hardcoded default address.\n"
+        "  Export your receiving EVM address (Base), e.g.:  "
+        "export X402_PAY_TO=0xYourAddress\n")
+    raise SystemExit(2)
 FACILITATOR = os.environ.get("X402_FACILITATOR", "https://x402.org/facilitator").rstrip("/")
 PORT = int(os.environ.get("X402_PORT", "8765"))
+
+# Hosted-mode caps: probe makes REAL upstream calls, so a caller paying $0.05
+# must not be able to ask for limit=1000 / workers=500 and burn the operator's
+# upstream quota. The server-side clamp wins over client arguments.
+PROBE_LIMIT_CAP = int(os.environ.get("X402_MAX_PROBE_LIMIT", "20"))
+PROBE_WORKERS_CAP = int(os.environ.get("X402_MAX_PROBE_WORKERS", "4"))
+GLOBAL_LIMIT_CAP = 200
 
 PRICES = {  # atomic USDC (6 decimals); 0 = free
     "list_models": "0",
@@ -90,24 +114,69 @@ def facilitator(path: str, body: dict) -> dict:
         return json.loads(r.read().decode())
 
 
-def verify_and_settle(x_payment_header: str, req: dict) -> dict:
-    """Verify the X-PAYMENT payload with the facilitator and settle on-chain.
-    Returns {"ok": bool, "tx": str|None, "error": str|None}."""
+def decode_payment(x_payment_header: str):
+    """Decode the base64url X-PAYMENT payload; None if malformed."""
     try:
-        payload = json.loads(unb64url(x_payment_header))
-    except Exception as e:
-        return {"ok": False, "tx": None, "error": f"bad X-PAYMENT: {e}"}
-    body = {"x402Version": 1, "paymentPayload": payload, "paymentRequirements": req}
+        return json.loads(unb64url(x_payment_header))
+    except Exception:
+        return None
+
+
+def _payment_body(payload, req: dict) -> dict:
+    return {"x402Version": 1, "paymentPayload": payload, "paymentRequirements": req}
+
+
+def verify_payment(x_payment_header: str, req: dict) -> dict:
+    """Phase 1 — verify the X-PAYMENT payload with the facilitator.
+
+    Signature/permit checks only: NO money moves yet, so a later tool failure
+    leaves the caller uncharged.
+    """
+    payload = decode_payment(x_payment_header)
+    if payload is None:
+        return {"ok": False, "payload": None, "error": "bad X-PAYMENT payload"}
     try:
-        v = facilitator("/verify", body)
+        v = facilitator("/verify", _payment_body(payload, req))
         if not v.get("isValid"):
-            return {"ok": False, "tx": None, "error": "invalid payment: " + json.dumps(v)[:200]}
-        s = facilitator("/settle", body)
+            return {"ok": False, "payload": None,
+                    "error": "invalid payment: " + json.dumps(v)[:200]}
+        return {"ok": True, "payload": payload, "error": None}
+    except Exception as e:
+        return {"ok": False, "payload": payload, "error": f"facilitator error: {e}"}
+
+
+def settle_payment(payload, req: dict) -> dict:
+    """Phase 2 — settle on-chain. Call ONLY after the tool has succeeded."""
+    try:
+        s = facilitator("/settle", _payment_body(payload, req))
         if not s.get("success"):
-            return {"ok": False, "tx": s.get("transaction"), "error": "settle failed: " + json.dumps(s)[:200]}
+            return {"ok": False, "tx": s.get("transaction"),
+                    "error": "settle failed: " + json.dumps(s)[:200]}
         return {"ok": True, "tx": s.get("transaction"), "error": None}
     except Exception as e:
         return {"ok": False, "tx": None, "error": f"facilitator error: {e}"}
+
+
+def _sanitize_args(name, args) -> dict:
+    """Clamp caller-supplied limits server-side (paid-amplification guard)."""
+    if not isinstance(args, dict):
+        return {}
+    out = dict(args)
+    try:
+        raw = out.get("limit")
+        cap = PROBE_LIMIT_CAP if name == "probe" else GLOBAL_LIMIT_CAP
+        if raw is not None and str(raw).strip() != "":
+            out["limit"] = str(max(1, min(cap, int(raw))))
+    except (TypeError, ValueError):
+        pass
+    if name == "probe":
+        try:
+            raw = out.get("workers")
+            if raw is not None and str(raw).strip() != "":
+                out["workers"] = str(max(1, min(PROBE_WORKERS_CAP, int(raw))))
+        except (TypeError, ValueError):
+            pass
+    return out
 
 
 def tool_spec():
@@ -127,6 +196,15 @@ def tool_spec():
     ]
 
 
+CORS_HEADERS = {
+    "Access-Control-Allow-Origin": "*",
+    "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+    "Access-Control-Allow-Headers": "Content-Type, Authorization, X-PAYMENT, Mcp-Session-Id",
+    # Browser clients (MCP Inspector in a page) must be able to read them.
+    "Access-Control-Expose-Headers": "PAYMENT-REQUIRED, PAYMENT-RESPONSE",
+}
+
+
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
 
@@ -134,14 +212,24 @@ class Handler(BaseHTTPRequestHandler):
         pass
 
     def _json(self, code, obj, extra_headers=None):
+        headers = dict(CORS_HEADERS)
+        if extra_headers:
+            headers.update(extra_headers)
         body = json.dumps(obj).encode()
         self.send_response(code)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))
-        for k, v in (extra_headers or {}).items():
+        for k, v in headers.items():
             self.send_header(k, v)
         self.end_headers()
         self.wfile.write(body)
+
+    def do_OPTIONS(self):  # CORS preflight
+        self.send_response(204)
+        for k, v in CORS_HEADERS.items():
+            self.send_header(k, v)
+        self.send_header("Content-Length", "0")
+        self.end_headers()
 
     def _resource(self):
         proto = self.headers.get("X-Forwarded-Proto") or "http"
@@ -183,6 +271,11 @@ class Handler(BaseHTTPRequestHandler):
         except Exception:
             self._json(400, {"error": "bad json"})
             return
+        if not isinstance(msg, dict):
+            # A JSON array/string is valid JSON but not a JSON-RPC message;
+            # msg.get below would raise AttributeError inside a request thread.
+            self._json(400, {"error": "jsonrpc message must be an object"})
+            return
 
         method = msg.get("method")
         mid = msg.get("id")
@@ -195,7 +288,11 @@ class Handler(BaseHTTPRequestHandler):
             }})
             return
         if method and method.startswith("notifications/"):
-            self.send_response(202); self.send_header("Content-Length", "0"); self.end_headers()
+            self.send_response(202)
+            for k, v in CORS_HEADERS.items():
+                self.send_header(k, v)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
             return
         if method == "ping":
             self._json(200, {"jsonrpc": "2.0", "id": mid, "result": {}})
@@ -204,9 +301,11 @@ class Handler(BaseHTTPRequestHandler):
             self._json(200, {"jsonrpc": "2.0", "id": mid, "result": {"tools": tool_spec()}})
             return
         if method == "tools/call":
-            params = msg.get("params") or {}
+            params = msg.get("params")
+            if not isinstance(params, dict):
+                params = {}
             name = params.get("name")
-            args = params.get("arguments") or {}
+            args = _sanitize_args(name, params.get("arguments"))
             fn = _tool_fn(name)
             if fn is None:
                 self._json(200, {"jsonrpc": "2.0", "id": mid,
@@ -224,23 +323,34 @@ class Handler(BaseHTTPRequestHandler):
                                       "data": {"x402": challenge}}}
                     self._json(402, body, {"PAYMENT-REQUIRED": b64url(json.dumps(challenge).encode())})
                     return
-                res = verify_and_settle(xpay, req)
-                if not res["ok"]:
+                # Two-phase payment. Settling before execution would charge the
+                # caller on-chain for a call that may still fail (bad args,
+                # unknown model, upstream 5xx) with no refund path.
+                v = verify_payment(xpay, req)
+                if not v["ok"]:
                     self._json(402, {"jsonrpc": "2.0", "id": mid,
-                                     "error": {"code": 402, "message": res["error"]}})
+                                     "error": {"code": 402, "message": v["error"]}})
                     return
                 try:
                     text = fn(CTX, args)
                 except Exception as e:
+                    sys.stderr.write(f"tool {name} failed after verify; not settling: {e}\n")
                     self._json(200, {"jsonrpc": "2.0", "id": mid,
                                      "result": {"content": [{"type": "text", "text": f"tool error: {e}"}],
                                                 "isError": True}})
                     return
-                pay_resp = b64url(json.dumps({"x402Version": 1, "transaction": res["tx"],
-                                              "network": NETWORK}).encode())
+                s = settle_payment(v["payload"], req)
+                headers = {}
+                if s["ok"]:
+                    headers["PAYMENT-RESPONSE"] = b64url(json.dumps(
+                        {"x402Version": 1, "transaction": s["tx"], "network": NETWORK}).encode())
+                else:
+                    # The caller already got their answer; a settlement failure
+                    # is the operator's problem — log it, don't punish them.
+                    sys.stderr.write(f"settle failed for {name}: {s['error']}\n")
                 self._json(200, {"jsonrpc": "2.0", "id": mid,
                                  "result": {"content": [{"type": "text", "text": text}]}},
-                           {"PAYMENT-RESPONSE": pay_resp})
+                            headers)
                 return
             # free tool
             try:
@@ -258,7 +368,8 @@ class Handler(BaseHTTPRequestHandler):
 
 def main():
     srv = ThreadingHTTPServer(("0.0.0.0", PORT), Handler)
-    print(f"modellens-x402 on :{PORT}  payTo={PAY_TO}  facilitator={FACILITATOR}", flush=True)
+    print(f"modellens-x402 on :{PORT}  payTo={PAY_TO}  facilitator={FACILITATOR}",
+          f"probe caps: limit<={PROBE_LIMIT_CAP} workers<={PROBE_WORKERS_CAP}", flush=True)
     srv.serve_forever()
 
 
