@@ -451,7 +451,10 @@ def _probe_stream_sse(ep: Endpoint, model: str) -> dict:
                          or delta.get("tool_calls"))
             if has_token:
                 if ttft_ms is None:
-                    ttft_ms = (time.monotonic() - t0) * 1000.0
+                    # From request start, not from headers: many gateways hold
+                    # the headers until the first token, and timing from
+                    # headers then reported TTFT as ~0ms.
+                    ttft_ms = open_ms + (time.monotonic() - t0) * 1000.0
                 chunks += 1
                 if chunks >= 4:  # a few valid tokens prove the stream is healthy
                     break
@@ -1260,6 +1263,8 @@ def _failure_class(row: dict) -> str:
         return f"server error ({status})"
     if status == 200:
         return "bad response (200 but unusable)"
+    if status == 400:
+        return "bad request (400, model rejects the call)"
     return f"other ({status})"
 
 
@@ -1590,6 +1595,13 @@ def main() -> int:
     ap.add_argument("--all", action="store_true",
                     help="ranking: also list untested models")
     args = ap.parse_args()
+    # Reports go to files and pipes; a Windows console code page would mangle
+    # the non-ASCII characters in them (e.g. "—" came out as "��").
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding="utf-8")
+        except (AttributeError, ValueError):
+            pass
 
     if args.config and not os.path.exists(args.config):
         sys.stderr.write(f"modellens: config not found: {args.config}\n")
