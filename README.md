@@ -1,24 +1,41 @@
-# ModelLens
-
 <!-- mcp-name: io.github.Greatbeing/modellens -->
 
-**See which of your models actually works.**
+<div align="center">
 
-An MCP server that turns any OpenAI-compatible gateway into an observable,
-rankable set of models. It discovers what a provider advertises, probes what
-works *right now* — latency, success, cancellation, streaming, tool calling —
-keeps the history, and answers **"which model should I use?"**
+# 🔭 ModelLens
 
-Zero third-party dependencies. Python 3.9+ standard library only.
+### See which of your models actually works.
 
-[![PyPI version](https://img.shields.io/pypi/v/modellens-mcp.svg)](https://pypi.org/project/modellens-mcp/)
-[![PyPI downloads](https://img.shields.io/pypi/dm/modellens-mcp.svg)](https://pypistats.org/packages/modellens-mcp)
+Discover, probe, rank and **route** across any OpenAI-compatible gateway —
+on measured evidence, not on a model list.
+
+[![PyPI version](https://img.shields.io/pypi/v/modellens-mcp.svg?color=2563eb)](https://pypi.org/project/modellens-mcp/)
+[![PyPI downloads](https://img.shields.io/pypi/dm/modellens-mcp.svg?color=7c3aed)](https://pypistats.org/packages/modellens-mcp)
+[![Tests](https://github.com/Greatbeing/modellens/actions/workflows/test.yml/badge.svg)](https://github.com/Greatbeing/modellens/actions/workflows/test.yml)
+[![Python](https://img.shields.io/badge/python-3.9%2B-3776ab)](pyproject.toml)
+[![Zero deps](https://img.shields.io/badge/dependencies-0-16a34a)](pyproject.toml)
+[![License: MIT](https://img.shields.io/badge/license-MIT-64748b)](LICENSE)
+<br>
 [![MCP Registry](https://img.shields.io/badge/MCP%20Registry-io.github.Greatbeing%2Fmodellens-blue)](https://registry.modelcontextprotocol.io/servers/io.github.Greatbeing/modellens)
 [![Greatbeing/modellens MCP server](https://glama.ai/mcp/servers/Greatbeing/modellens/badges/score.svg)](https://glama.ai/mcp/servers/Greatbeing/modellens)
 [![Live status](https://img.shields.io/badge/status-live_probe_report-blue)](https://greatbeing.github.io/modellens/)
-[![Tests](https://github.com/Greatbeing/modellens/actions/workflows/test.yml/badge.svg)](https://github.com/Greatbeing/modellens/actions/workflows/test.yml)
 
-- 中文落地页：[LANDING_ZH.md](LANDING_ZH.md)
+**[Live status](https://greatbeing.github.io/modellens/)** ·
+**[30-second start](#30-second-start)** ·
+**[MCP server](#run-as-an-mcp-server)** ·
+**[Routing proxy](#proxy-route-on-evidence)** ·
+**[How it scores](#how-it-scores)** ·
+**[中文](LANDING_ZH.md)**
+
+</div>
+
+| | |
+|---|---|
+| 🔍 **Discover** | Everything each endpoint advertises, with pricing when it is published |
+| 🧪 **Probe** | Real completions: latency, success, cancellation, streaming TTFT, tool calls |
+| 📊 **Rank** | Success on its 95% lower bound, so thin evidence never tops the table |
+| 🧭 **Route** | OpenAI-compatible proxy: `model: "auto"` goes to the best measured model, with failover, circuit breaker and cost ceiling |
+| 🪶 **Zero deps** | Python 3.9+ standard library only. MCP over stdio, CLI, Docker, systemd |
 
 ## 30-second start
 
