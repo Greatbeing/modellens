@@ -14,7 +14,7 @@ Zero third-party dependencies. Python 3.9+ standard library only.
 [![PyPI version](https://img.shields.io/pypi/v/modellens-mcp.svg)](https://pypi.org/project/modellens-mcp/)
 [![PyPI downloads](https://img.shields.io/pypi/dm/modellens-mcp.svg)](https://pypistats.org/packages/modellens-mcp)
 [![MCP Registry](https://img.shields.io/badge/MCP%20Registry-io.github.Greatbeing%2Fmodellens-blue)](https://registry.modelcontextprotocol.io/servers/io.github.Greatbeing/modellens)
-[![Glama](https://img.shields.io/badge/Glama-Modellens-orange)](https://glama.ai/mcp/servers/Greatbeing/modellens)
+[![Greatbeing/modellens MCP server](https://glama.ai/mcp/servers/Greatbeing/modellens/badges/score.svg)](https://glama.ai/mcp/servers/Greatbeing/modellens)
 [![Live status](https://img.shields.io/badge/status-live_probe_report-blue)](https://greatbeing.github.io/modellens/)
 [![Tests](https://github.com/Greatbeing/modellens/actions/workflows/test.yml/badge.svg)](https://github.com/Greatbeing/modellens/actions/workflows/test.yml)
 
