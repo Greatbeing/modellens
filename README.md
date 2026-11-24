@@ -247,11 +247,59 @@ hosted x402 server does not offer `audit`; run it locally.
 
 Every probe is a real request, so the numbers are evidence, not estimates.
 
-| Signal | Weight | Notes |
+**In one line:**
+
+```math
+\text{score} = 0.5 \times \text{success} + 0.3 \times \text{speed} + 0.2 \times \text{stability}
+```
+
+Each part is a 0–100 number:
+
+| Part | Weight | What it measures | How it is computed |
+|---|---|---|---|
+| 🎯 **success** | 50% | Does it answer? | Success rate, **discounted for small samples** (below) |
+| ⚡ **speed** | 30% | How fast? | `100 × (1 − median / 8 s)`: 0 s → 100, 4 s → 50, ≥ 8 s → 0 |
+| 🛡️ **stability** | 20% | Does it hang or get cut off? | `100 − 2 × cancel rate`: 0% → 100, 50% → 0 |
+
+A model with **0% success scores 0**, whatever its speed.
+
+#### Why "discounted for small samples"?
+
+One lucky reply is not proof. ModelLens scores success on the
+[Wilson](https://en.wikipedia.org/wiki/Binomial_proportion_confidence_interval#Wilson_score_interval)
+95% lower bound: *the success rate we can be 95% sure the model beats*. The
+fewer the probes, the bigger the discount:
+
+| Probes that succeeded | Raw rate | Counted as |
 |---|---|---|
-| Success rate | 50% | 0% success ⇒ score 0, regardless of anything else |
-| Median latency | 30% | Linear to 0 at 8 s; unmeasured latency earns no credit |
-| Cancellation rate | 20% | Timeouts and client cancellations |
+| 1 of 1 | 100% | **21%** |
+| 5 of 5 | 100% | **57%** |
+| 20 of 20 | 100% | **84%** |
+| 40 of 40 | 100% | **91%** |
+
+<details>
+<summary>The formula (for the curious)</summary>
+
+With $k$ successes out of $n$ probes, $\hat p = k/n$ and $z = 1.96$:
+
+```math
+\text{success} = 100 \times \frac{\hat p + \frac{z^2}{2n} - z\sqrt{\frac{\hat p(1-\hat p)}{n} + \frac{z^2}{4n^2}}}{1 + \frac{z^2}{n}}
+```
+
+</details>
+
+#### Worked example
+
+| | Lucky model | Proven model |
+|---|---|---|
+| Evidence | 1 of 1 ok, 150 ms | 40 of 40 ok, 400 ms |
+| success × 0.5 | 21 × 0.5 = 10.3 | 91 × 0.5 = 45.6 |
+| speed × 0.3 | 98 × 0.3 = 29.4 | 95 × 0.3 = 28.5 |
+| stability × 0.2 | 100 × 0.2 = 20.0 | 100 × 0.2 = 20.0 |
+| **score** | **59.8** | **94.1** |
+
+The lucky model is faster, but the proven one ranks first. Rows with fewer
+than 5 probes are also flagged `low_evidence`.
 
 History is kept per model (newest 200 probes) in `history.json`, so rankings
 improve as you use it. One file can be shared by several writers — the CLI, the
