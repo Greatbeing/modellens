@@ -1,9 +1,13 @@
 # Changelog
 
-## Unreleased
+## 0.2.2 - 2026-11-24
 
 ### Added
 - `audit` tool / `--once audit`: probe every model one gateway advertises and get a shareable markdown health report (advertised vs. working, latency p50/p90/max, TTFT, streaming and tool-call support, failure reasons). Not exposed by the hosted x402 server, which now only serves tools that have an explicit price.
+
+### Fixed
+- Streaming TTFT is timed from request start, not from response headers; gateways that hold headers until the first token were reported at ~0ms.
+- 400 responses get their own failure class; CLI output is UTF-8 so reports piped to files on Windows keep their punctuation.
 
 ## 0.2.1 - 2026-11-24
 

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "modellens-mcp"
-version = "0.2.1"
+version = "0.2.2"
 description = "See which of your models actually works. MCP server, CLI and evidence-based routing proxy that discovers, probes, ranks and recommends models across OpenAI-compatible gateways."
 readme = "README.md"
 license = { text = "MIT" }
