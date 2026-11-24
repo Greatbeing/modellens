@@ -1,5 +1,10 @@
 # Changelog
 
+## Unreleased
+
+### Added
+- `audit` tool / `--once audit`: probe every model one gateway advertises and get a shareable markdown health report (advertised vs. working, latency p50/p90/max, TTFT, streaming and tool-call support, failure reasons). Not exposed by the hosted x402 server, which now only serves tools that have an explicit price.
+
 ## 0.2.1 - 2026-11-24
 
 ### Changed

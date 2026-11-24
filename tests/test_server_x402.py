@@ -120,6 +120,8 @@ class ServerX402Test(unittest.TestCase):
         st, _, body = self.req("POST", "/mcp", {"jsonrpc": "2.0", "id": 2, "method": "tools/list"})
         tools = json.loads(body)["result"]["tools"]
         self.assertEqual(len(tools), 5)
+        # audit runs up to 100 billed probes and has no price: never served free.
+        self.assertNotIn("audit", [t["name"] for t in tools])
 
     def test_unknown_tool_is_jsonrpc_error_not_free_run(self):
         st, _, body = self.req("POST", "/mcp", {"jsonrpc": "2.0", "id": 3, "method": "tools/call",

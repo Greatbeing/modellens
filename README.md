@@ -227,6 +227,22 @@ recommended) · `untested`.
 
 ---
 
+## Audit a gateway
+
+One command, one shareable report: how many of the models a gateway advertises
+actually answer right now, how fast, and why the rest fail.
+
+```bash
+modellens --config config.json --data history.json --once audit --endpoint gw --limit 100 > audit.md
+```
+
+The report has a summary (advertised vs. working, latency p50/p90/max, TTFT,
+streaming and tool-call support), a failure breakdown (404, 429, auth, 5xx,
+timeouts, unusable 200s) and every probed model. Each model gets one real,
+billed completion, so set `--limit` to what you are willing to spend. Results
+are also saved as probe history, so `ranking` and the proxy reuse them. The
+hosted x402 server does not offer `audit`; run it locally.
+
 ## How it scores
 
 Every probe is a real request, so the numbers are evidence, not estimates.

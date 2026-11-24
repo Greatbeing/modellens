@@ -14,6 +14,7 @@ import sys
 import tempfile
 import time
 import unittest
+from unittest import mock
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, REPO_ROOT)
@@ -762,7 +763,7 @@ class McpProtocolTest(unittest.TestCase):
         r = M.handle(self.ctx, {"id": 2, "method": "tools/list"})
         tools = r["result"]["tools"]
         self.assertEqual([t["name"] for t in tools],
-                         ["list_models", "probe", "ranking", "recommend", "report"])
+                         ["list_models", "probe", "ranking", "recommend", "report", "audit"])
         self.assertTrue(all(t.get("annotations") for t in tools))
 
     def test_annotations_are_honest_about_network(self):
@@ -807,6 +808,52 @@ class EvidenceConfidenceTest(unittest.TestCase):
         s = M.score_model([row(True, 200, 100.0)])
         self.assertEqual(s["success_rate"], 100.0)
         self.assertAlmostEqual(s["success_lower_bound"], 20.7, places=1)
+
+
+class AuditTest(unittest.TestCase):
+    def rows(self):
+        return [
+            {"endpoint": "gw", "model": "fast", "ok": True, "status": 200, "latency_ms": 300.0,
+             "ttft_ms": 120.0, "stream_ok": True, "tools_ok": True},
+            {"endpoint": "gw", "model": "slow", "ok": True, "status": 200, "latency_ms": 12000.0,
+             "stream_ok": False},
+            {"endpoint": "gw", "model": "gone", "ok": False, "status": 404, "latency_ms": None},
+            {"endpoint": "gw", "model": "quota", "ok": False, "status": 429, "latency_ms": None},
+        ]
+
+    def test_summary_counts_and_failure_reasons(self):
+        md = M.build_audit("gw", 6, self.rows(), generated_at="T")
+        self.assertIn("# Gateway audit: gw", md)
+        self.assertIn("| Models advertised | 6 |", md)
+        self.assertIn("**2/4 (50%)**", md)
+        self.assertIn("| Not probed (limit) | 2 |", md)
+        self.assertIn("| not found (404) | 1 |", md)
+        self.assertIn("| quota / rate limit (429) | 1 |", md)
+        self.assertIn("| Streaming works | 1/2 (50%) |", md)
+        self.assertIn("12.0s", md)
+        # working models first, fastest first
+        self.assertLess(md.index("`fast`"), md.index("`slow`"))
+        self.assertLess(md.index("`slow`"), md.index("`gone`"))
+
+    def test_empty_run_does_not_crash(self):
+        md = M.build_audit("gw", 0, [], generated_at="T")
+        self.assertIn("0/0", md)
+
+    def test_tool_audit_probes_and_records(self):
+        ctx = M.Context("", os.path.join(tempfile.mkdtemp(), "h.json"))
+        ctx.endpoints = [M.Endpoint({"name": "gw", "base_url": "http://x/v1"})]
+        rows = {r["model"]: r for r in self.rows()}
+        with mock.patch.object(M, "discover_models", return_value=list(rows)), \
+             mock.patch.object(M, "_probe_one", side_effect=lambda ep, m, t, s: dict(rows[m])):
+            md = M.tool_audit(ctx, {"limit": 3})
+        self.assertIn("| Models probed | 3 |", md)
+        self.assertEqual(len(ctx.store.rows), 3)
+
+    def test_tool_audit_needs_endpoint_when_ambiguous(self):
+        ctx = M.Context("", os.path.join(tempfile.mkdtemp(), "h.json"))
+        ctx.endpoints = [M.Endpoint({"name": "a", "base_url": "http://a/v1"}),
+                         M.Endpoint({"name": "b", "base_url": "http://b/v1"})]
+        self.assertIn("audit needs endpoint", M.tool_audit(ctx, {}))
 
 
 if __name__ == '__main__':

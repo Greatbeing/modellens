@@ -1235,6 +1235,145 @@ def tool_report(ctx: Context, args: dict) -> str:
     return "\n".join(lines)
 
 
+AUDIT_DEFAULT_LIMIT = 100
+
+
+def _pct(values: list[float], q: float) -> float | None:
+    """Nearest-rank percentile; None for no data."""
+    if not values:
+        return None
+    s = sorted(values)
+    return s[max(0, math.ceil(len(s) * q) - 1)]
+
+
+def _failure_class(row: dict) -> str:
+    status = row.get("status")
+    if status == 404:
+        return "not found (404)"
+    if status == 429:
+        return "quota / rate limit (429)"
+    if status in (401, 403):
+        return f"auth ({status})"
+    if status in (0, 499):
+        return "timeout / cancelled"
+    if isinstance(status, int) and status >= 500:
+        return f"server error ({status})"
+    if status == 200:
+        return "bad response (200 but unusable)"
+    return f"other ({status})"
+
+
+def build_audit(endpoint: str, advertised: int, rows: list[dict],
+                generated_at: str | None = None) -> str:
+    """Markdown health report for ONE gateway, from ONE fresh probe pass.
+
+    Pure function of its inputs so it can be tested without a network. It
+    reports what this run measured — a single pass per model, which the report
+    says plainly — rather than mixing in older history.
+    """
+    if generated_at is None:
+        generated_at = time.strftime("%Y-%m-%d %H:%M UTC", time.gmtime())
+    probed = len(rows)
+    ok_rows = [r for r in rows if r.get("ok")]
+    working = len(ok_rows)
+    lats = [r["latency_ms"] for r in ok_rows
+            if isinstance(r.get("latency_ms"), (int, float))
+            and not isinstance(r.get("latency_ms"), bool)]
+    ttfts = [r["ttft_ms"] for r in ok_rows
+             if isinstance(r.get("ttft_ms"), (int, float))
+             and not isinstance(r.get("ttft_ms"), bool)]
+
+    def ms(v):
+        return "-" if v is None else (f"{v / 1000:.1f}s" if v >= 10000 else f"{v:.0f}ms")
+
+    def share(n, d):
+        return f"{n}/{d} ({n / d * 100:.0f}%)" if d else "0/0"
+
+    lines = [f"# Gateway audit: {endpoint}", "",
+             f"_Generated {generated_at} by [ModelLens](https://github.com/Greatbeing/modellens) "
+             f"— one real completion per model, measured from where this ran._", "",
+             "## Summary", "",
+             "| | |", "| --- | --- |",
+             f"| Models advertised | {advertised} |",
+             f"| Models probed | {probed} |",
+             f"| **Working now** | **{share(working, probed)}** |"]
+    if probed < advertised:
+        lines.append(f"| Not probed (limit) | {advertised - probed} |")
+    lines += [f"| Latency p50 / p90 / max | {ms(_pct(lats, 0.5))} / {ms(_pct(lats, 0.9))} "
+              f"/ {ms(max(lats) if lats else None)} |"]
+    if ttfts:
+        lines.append(f"| Time to first token p50 | {ms(_pct(ttfts, 0.5))} |")
+    stream_known = [r for r in ok_rows if r.get("stream_ok") is not None]
+    if stream_known:
+        lines.append(f"| Streaming works | "
+                     f"{share(sum(1 for r in stream_known if r['stream_ok']), len(stream_known))} |")
+    tools_known = [r for r in ok_rows if r.get("tools_ok") is not None]
+    if tools_known:
+        lines.append(f"| Tool calling works | "
+                     f"{share(sum(1 for r in tools_known if r['tools_ok']), len(tools_known))} |")
+
+    failures: dict[str, int] = {}
+    for r in rows:
+        if not r.get("ok"):
+            k = _failure_class(r)
+            failures[k] = failures.get(k, 0) + 1
+    if failures:
+        lines += ["", "## Why models failed", "", "| reason | models |", "| --- | --- |"]
+        for k, n in sorted(failures.items(), key=lambda kv: (-kv[1], kv[0])):
+            lines.append(f"| {k} | {n} |")
+
+    def sort_key(r):
+        lat = r.get("latency_ms")
+        return (not r.get("ok"), lat if isinstance(lat, (int, float)) else 1e12, r.get("model", ""))
+
+    lines += ["", "## Every model probed", "",
+              "| model | result | latency | ttft | stream | tools |",
+              "| --- | --- | --- | --- | --- | --- |"]
+    yn = {True: "yes", False: "no", None: "-"}
+    for r in sorted(rows, key=sort_key):
+        result = "ok" if r.get("ok") else f"fail: {_failure_class(r)}"
+        lat = r.get("latency_ms") if r.get("ok") else None
+        lines.append(f"| `{r.get('model')}` | {result} | {ms(lat)} | {ms(r.get('ttft_ms'))} "
+                     f"| {yn.get(r.get('stream_ok'), '-')} | {yn.get(r.get('tools_ok'), '-')} |")
+    lines += ["", "> One probe per model is a snapshot, not a verdict: rerun the audit, or keep "
+                  "ModelLens probing, before drawing conclusions about a single model."]
+    return "\n".join(lines)
+
+
+def tool_audit(ctx: Context, args: dict) -> str:
+    endpoint = (args.get("endpoint") or "").strip()
+    enabled = [ep for ep in ctx.endpoints if ep.enabled]
+    if not endpoint:
+        if len(enabled) != 1:
+            return ("audit needs endpoint=<name> (configured: "
+                    + ", ".join(ep.name for ep in enabled) + ")")
+        endpoint = enabled[0].name
+    ep = next((e for e in enabled if e.name == endpoint), None)
+    if ep is None:
+        return f"unknown or disabled endpoint: {endpoint}"
+    limit = _clamp_int(args.get("limit"), AUDIT_DEFAULT_LIMIT, 1, PROBE_MAX_LIMIT)
+    workers = _clamp_int(args.get("workers"), PROBE_WORKERS_DEFAULT, 1, PROBE_WORKERS_MAX)
+    check_tools = _parse_bool(args.get("check_tools"))
+    check_stream = _parse_bool(args.get("check_stream"), default=True)
+    contains = (args.get("contains") or "").strip().lower()
+
+    models = discover_models(ep)
+    if contains:
+        models = [m for m in models if contains in m.lower()]
+    if not models:
+        return f"{endpoint} advertises no models (or /models is unreachable)."
+    advertised = len(models)
+    targets = models[:limit]
+    if workers > 1:
+        from concurrent.futures import ThreadPoolExecutor
+        with ThreadPoolExecutor(max_workers=workers) as ex:
+            rows = list(ex.map(lambda m: _probe_one(ep, m, check_tools, check_stream), targets))
+    else:
+        rows = [_probe_one(ep, m, check_tools, check_stream) for m in targets]
+    ctx.store.append(rows)  # the audit is evidence too: ranking and the proxy reuse it
+    return build_audit(endpoint, advertised, rows)
+
+
 TOOLS = [
     ("list_models",
      "List the models each configured endpoint advertises (GET {base_url}/models). "
@@ -1283,6 +1422,19 @@ TOOLS = [
      "(e.g. paste into a STATUS.md).",
      {},
      tool_report),
+    ("audit",
+     "Health-check ONE gateway end to end: discover every model it advertises, probe each "
+     "once with a REAL completion, and return a shareable markdown report — how many "
+     "advertised models actually work, latency p50/p90, streaming and tool-call support, and "
+     "why the rest failed. Side effects: one billed completion per model (keep limit "
+     "sensible); results are also recorded as probe history.",
+     {"endpoint": "endpoint name to audit (optional when only one is configured)",
+      "limit": f"max models to probe (default {AUDIT_DEFAULT_LIMIT})",
+      "contains": "substring filter on model id",
+      "check_tools": "also test function calling (slower)",
+      "check_stream": "also test streaming / TTFT (default on)",
+      "workers": "parallel probe workers (default 1)"},
+     tool_audit),
 ]
 
 # MCP tool annotations (MCP spec 2025-06-18): tell agents the side-effect profile of each tool.
@@ -1300,6 +1452,8 @@ TOOL_ANNOTATIONS = {
                     "idempotentHint": True, "openWorldHint": True},
     "report":      {"readOnlyHint": True, "destructiveHint": False,
                     "idempotentHint": True, "openWorldHint": True},
+    "audit":       {"readOnlyHint": False, "destructiveHint": False,
+                    "idempotentHint": False, "openWorldHint": True},
 }
 
 

@@ -96,8 +96,15 @@ CTX = ml.Context(os.environ.get("MODELLENS_CONFIG", ""), os.environ.get("MODELLE
 MAX_BODY = 1_000_000  # bytes; a JSON-RPC call is tiny, cap to avoid memory abuse
 
 
+def _hosted_tools():
+    # Only tools with an explicit price are exposed. A tool missing from PRICES
+    # would otherwise be served as free: `audit` probes up to 100 models with
+    # real completions, so it stays a local/CLI tool, never a free hosted one.
+    return [t for t in ml.TOOLS if t[0] in PRICES]
+
+
 def _tool_fn(name):
-    for n, _, _, fn in ml.TOOLS:
+    for n, _, _, fn in _hosted_tools():
         if n == name:
             return fn
     return None
@@ -246,7 +253,7 @@ def tool_spec():
             },
             "x402Price": ("$" + format(int(PRICES.get(n, "0")) / 1e6, ".6f").rstrip("0").rstrip(".")) if int(PRICES.get(n, "0")) else "free",
         }
-        for n, d, spec, _ in ml.TOOLS
+        for n, d, spec, _ in _hosted_tools()
     ]
 
 
