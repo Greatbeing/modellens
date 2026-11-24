@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.2.1 - 2026-11-24
 
 ### Changed
 - Scoring: success now counts as the 95% Wilson lower bound, not the raw rate,
