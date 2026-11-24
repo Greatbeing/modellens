@@ -47,8 +47,13 @@ endpoint must be reachable from other hosts, and set `proxy.admin_token` in
 
 ## Seeding evidence before the first request
 
-A brand-new proxy has no history, so `auto` requests get `503 no_candidate`.
-Probe once with the same config first:
+With `proxy.probe.enabled: true` (as in `config.example.json`) the proxy probes
+up to `probe.warmup_limit` models (default 10) right after start-up, then tops
+up every `interval_s`, thinnest evidence first. Expect `503 no_candidate` only
+for the few seconds that first round takes.
+
+With probing disabled, a brand-new proxy has no history and `auto` requests get
+`503 no_candidate` until you probe once with the same config:
 
 ```bash
 modellens --config /etc/modellens/config.json \

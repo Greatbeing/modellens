@@ -8,7 +8,7 @@
     "listen": "127.0.0.1:8766",
     "profile": "capable",
     "max_attempts": 3,
-    "probe": {"enabled": false, "interval_s": 900, "check_tools": true},
+    "probe": {"enabled": true, "interval_s": 900, "limit": 3, "warmup_limit": 10, "check_tools": true},
     "pool": {"max_idle": 8, "idle_s": 60},
     "breaker": {"fail_threshold": 3, "open_s": 30},
     "budget": {"max_cost_usd": 0.05, "default_max_tokens": 1024, "allow_unpriced": true}

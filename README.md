@@ -20,6 +20,25 @@ Zero third-party dependencies. Python 3.9+ standard library only.
 
 - 中文落地页：[LANDING_ZH.md](LANDING_ZH.md)
 
+## 30-second start
+
+```bash
+pip install modellens-mcp
+cat > config.json <<'EOF'
+{"endpoints": [{"name": "gw", "base_url": "https://your-gateway/v1", "api_key": "sk-..."}]}
+EOF
+modellens --config config.json --data history.json --once probe --limit 10
+modellens --config config.json --data history.json --once ranking
+```
+
+That is the whole loop: discover, probe, rank. Rows with fewer than 5 probes
+are flagged `low_evidence`, and success is scored on its 95% lower bound, so a
+model that answered once does not top the table. Want routing instead of a
+table? Run the proxy (`modellens-proxy --config config.json`): with
+`proxy.probe.enabled` it probes on start-up and keeps the evidence fresh — see
+[Proxy](#proxy-route-on-evidence).
+
+
 ---
 
 ## Why
