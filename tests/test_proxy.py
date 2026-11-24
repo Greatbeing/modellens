@@ -989,7 +989,7 @@ class ProberToolsTest(ProxyHarness):
                                                "function": {"name": "modellens_ping",
                                                             "arguments": "{}"}}]}}]},
     }}
-    proxy_cfg = {"probe": {"enabled": True, "interval_s": 3600, "limit": 3,
+    proxy_cfg = {"probe": {"enabled": True, "interval_s": 3600, "warmup_limit": 0, "limit": 3,
                            "check_tools": True, "check_stream": False}}
 
     @staticmethod

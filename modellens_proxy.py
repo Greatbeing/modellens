@@ -99,6 +99,8 @@ class ProxyConfig:
         self.probe_enabled = bool(probe.get("enabled", False))
         self.probe_interval_s = float(probe.get("interval_s", 900))
         self.probe_limit = max(1, int(probe.get("limit", 3)))
+        # First round right after start-up, so a cold proxy can route quickly.
+        self.probe_warmup_limit = max(0, int(probe.get("warmup_limit", 10)))  # 0 = off
         self.probe_check_stream = bool(probe.get("check_stream", True))
         # Tool support cannot be known without asking, and a request that needs
         # tools is gated on it: probing it here is what turns "unknown" into a
@@ -991,30 +993,51 @@ class Prober(threading.Thread):
         self._run_lock = threading.Lock()
 
     def run(self) -> None:
+        # Probe straight away: a fresh proxy has no evidence and would answer
+        # 503 no_candidate for a whole interval otherwise.
+        if (self.app.cfg.probe_enabled and self.app.cfg.probe_warmup_limit
+                and not self._stop.is_set()):
+            self._safe_probe(self.app.cfg.probe_warmup_limit)
         while not self._stop.wait(self.app.cfg.probe_interval_s):
             if self.app.cfg.probe_enabled:
-                self.probe_once()
+                self._safe_probe()
 
-    def probe_once(self) -> list[dict]:
+    def _safe_probe(self, limit: int | None = None) -> None:
+        try:
+            self.probe_once(limit)
+        except Exception as exc:
+            sys.stderr.write(f"modellens-proxy: probe failed: {exc}\n")
+
+    def probe_once(self, limit: int | None = None) -> list[dict]:
         if not self._run_lock.acquire(blocking=False):
             return []
         try:
             table = self.app.table()
-            target = sorted(table.candidates,
-                            key=lambda c: (-(c.age_hours or 1e9), c.probe_rows, c.id)
-                            )[:self.app.cfg.probe_limit]
+            # Routable candidates plus untested/stale models: on a cold start
+            # nothing is routable yet, and those are exactly what needs probing.
+            pool = [(c.endpoint, c.model, c.probe_rows, c.age_hours)
+                    for c in table.candidates]
+            seen = {(e, m) for e, m, _, _ in pool}
+            for s in table.skipped:
+                if s.get("verdict") in ("untested", "stale"):
+                    ep_name, _, mid = s["id"].partition("/")
+                    if (ep_name, mid) not in seen:
+                        pool.append((ep_name, mid, 0, None))
+            # Thinnest evidence first, then oldest: fewest probes wins.
+            target = sorted(pool, key=lambda t: (t[2], -(t[3] if t[3] is not None else 1e9),
+                                                 t[0], t[1]))[:limit or self.app.cfg.probe_limit]
             by_name = {ep.name: ep for ep in self.app.ctx.endpoints}
             results = []
-            for cand in target:
-                ep = by_name.get(cand.endpoint)
+            for ep_name, model, _, _ in target:
+                ep = by_name.get(ep_name)
                 if ep is None:
                     continue
-                row = ml.probe_model(ep, cand.model,
+                row = ml.probe_model(ep, model,
                                      check_stream=self.app.cfg.probe_check_stream)
                 row["source"] = "probe"
                 if self.app.cfg.probe_check_tools and row.get("ok"):
                     # This is what turns `tools: unknown` into a routable "yes".
-                    row["tools_ok"] = ml.probe_tools(ep, cand.model)
+                    row["tools_ok"] = ml.probe_tools(ep, model)
                 results.append(row)
                 self.app.record(row)
             self.last_run = time.time()

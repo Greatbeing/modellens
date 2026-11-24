@@ -4,7 +4,7 @@
 // Run: node --test test/   (from worker/, zero dependencies)
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { median, scoreModel, aggregate, round1, formatAge, parseLimit } from '../src/index.js';
+import { median, scoreModel, aggregate, round1, formatAge, parseLimit, wilsonLower } from '../src/index.js';
 
 const row = (ok, status = 200, lat = null, probed_at) => ({ model: 'm', endpoint: 'e', ok, status, latency_ms: lat, ...(probed_at ? { probed_at } : {}) });
 const NOW = Date.parse('2026-11-21T12:00:00Z');
@@ -62,9 +62,9 @@ test('high latency is mixed, not healthy', () => {
   assert.equal(s.verdict, 'mixed');
 });
 
-test('score formula matches Python (85.0)', () => {
+test('score formula matches Python (76.9: success on Wilson lower bound)', () => {
   const s = scoreModel(Array.from({ length: 20 }, () => row(true, 200, 4000)));
-  assert.equal(s.score, 85);
+  assert.equal(s.score, 76.9);
 });
 
 test('aggregate sorts best-first and groups by endpoint+model', () => {
@@ -131,7 +131,7 @@ test('zero latency is healthy, missing latency is mixed', () => {
   const noLat = scoreModel(Array.from({ length: 5 }, () => row(true, 200, null)));
   assert.equal(noLat.verdict, 'mixed');
   assert.equal(noLat.median_latency_ms, null);
-  assert.equal(noLat.score, 70); // 50 success + 0 latency + 20 cancel, no crash
+  assert.equal(noLat.score, 48.3); // Wilson(5/5) success + 0 latency + 20 cancel, no crash
 });
 
 test('parseLimit clamps NaN / negative / huge', () => {
@@ -156,9 +156,11 @@ test('round1 ties-to-even matches Python round(x,1)', () => {
   assert.equal(round1(33.333333), 33.3);
 });
 
-test('score at an exact tie rounds like Python (81.25 -> 81.2)', () => {
-  const s = scoreModel(Array.from({ length: 10 }, () => row(true, 200, 5000)));
-  assert.equal(s.score, 81.2);
+test('one lucky probe does not outrank a proven model', () => {
+  const lucky = scoreModel([row(true, 200, 150)]);
+  const proven = scoreModel(Array.from({ length: 40 }, () => row(true, 200, 400)));
+  assert.ok(proven.score > lucky.score);
+  assert.ok(Math.abs(wilsonLower(1, 1) - 0.2065) < 1e-3);
 });
 
 // ---- staleness (mirrors modellens.py) ----

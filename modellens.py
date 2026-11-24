@@ -63,6 +63,23 @@ W_SUCCESS = 50.0
 W_LATENCY = 30.0
 W_CANCEL = 20.0
 LATENCY_REFERENCE_MS = 8000.0  # a median at or above this scores 0 on latency
+MIN_EVIDENCE = 5  # fewer probes than this is flagged low_evidence
+WILSON_Z = 1.96   # 95% confidence
+
+
+def wilson_lower(successes: int, n: int, z: float = WILSON_Z) -> float:
+    """Lower bound of the Wilson score interval, in [0, 1].
+
+    Scoring on this instead of the raw rate means one lucky probe (1/1) cannot
+    outrank a model that succeeded 40 times out of 40.
+    """
+    if n <= 0:
+        return 0.0
+    p = successes / n
+    z2 = z * z
+    centre = p + z2 / (2 * n)
+    margin = z * math.sqrt((p * (1 - p) + z2 / (4 * n)) / n)
+    return max(0.0, (centre - margin) / (1 + z2 / n))
 FAST_MIN_SUCCESS = 90.0  # 'fast' only routes to models at or above this success rate
 STALE_AFTER_HOURS = 6.0  # evidence older than this is too old to route on:
 # the probe cron runs every 2h, so 6h is three missed cycles. A model that was
@@ -876,6 +893,7 @@ def score_model(rows: list[dict], now: float | None = None) -> dict:
             "attempts": attempts, "ok": 0, "failed": attempts,
             "cancelled": cancelled,
             "success_rate": 0.0, "cancel_rate": round(cancel_rate, 1),
+            "success_lower_bound": 0.0, "low_evidence": attempts < MIN_EVIDENCE,
             "median_latency_ms": None, "p95_latency_ms": None,
             "score": 0.0, "verdict": verdict,
             "last_probed_at": last_probed_at, "age_hours": age_hours,
@@ -885,7 +903,10 @@ def score_model(rows: list[dict], now: float | None = None) -> dict:
     # credit — honest, and it also keeps None out of the arithmetic.
     latency_score = (0.0 if med is None
                      else max(0.0, min(1.0, 1.0 - (med / LATENCY_REFERENCE_MS))) * 100.0)
-    score = (success_rate * W_SUCCESS + latency_score * W_LATENCY
+    # Success is scored on the Wilson lower bound, so sample size counts:
+    # thin evidence scores lower until more probes confirm it.
+    success_evidence = wilson_lower(len(oks), attempts) * 100.0
+    score = (success_evidence * W_SUCCESS + latency_score * W_LATENCY
              + max(0.0, 100.0 - cancel_rate * 2.0) * W_CANCEL) / (
         W_SUCCESS + W_LATENCY + W_CANCEL)
 
@@ -895,6 +916,9 @@ def score_model(rows: list[dict], now: float | None = None) -> dict:
         "failed": failures,
         "cancelled": cancelled,
         "success_rate": round(success_rate, 1),
+        # Lower bound of the 95% Wilson interval: 1/1 ok is ~21%, 20/20 is ~84%.
+        "success_lower_bound": round(wilson_lower(len(oks), attempts) * 100.0, 1),
+        "low_evidence": attempts < MIN_EVIDENCE,
         "cancel_rate": round(cancel_rate, 1),
         "median_latency_ms": round(med, 1) if med is not None else None,
         "p95_latency_ms": round(

@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+### Changed
+- Scoring: success now counts as the 95% Wilson lower bound, not the raw rate,
+  so one lucky probe (1/1, ~21%) can no longer outrank a model proven over 40
+  probes. Rows carry `success_lower_bound` and `low_evidence` (< 5 probes).
+  The hosted worker scores identically.
+- Proxy prober: probes once right after start-up (`probe.warmup_limit`,
+  default 10, 0 = off) so a fresh proxy stops answering `503 no_candidate`
+  for a whole interval, and now targets untested/stale models too, thinnest
+  evidence first.
+
 ### Added
 - `deploy/`: a proxy Dockerfile (non-root, read-only root, `/data` volume,
   healthcheck), a Compose file, a hardened systemd unit and install notes. CI

@@ -228,6 +228,16 @@ function round1(x) {
   return Number(x.toFixed(1));
 }
 
+// Mirrors modellens.wilson_lower: score success on the 95% Wilson lower bound
+// so one lucky probe cannot outrank a model proven over many.
+export function wilsonLower(k, n, z = 1.96) {
+  if (!(n > 0)) return 0;
+  const p = k / n, z2 = z * z;
+  const centre = p + z2 / (2 * n);
+  const margin = z * Math.sqrt((p * (1 - p) + z2 / (4 * n)) / n);
+  return Math.max(0, (centre - margin) / (1 + z2 / n));
+}
+
 function scoreModel(rows, nowMs) {
   const now = nowMs == null ? Date.now() : nowMs;
   const attempts = rows.length;
@@ -269,7 +279,8 @@ function scoreModel(rows, nowMs) {
   // Unknown latency (ok rows with no latency recorded) earns no latency
   // credit — same as the Python core, and it keeps null out of the math.
   const latency_score = med == null ? 0 : Math.max(0, Math.min(1, 1 - med / 8000)) * 100;
-  const score = (success_rate * 50 + latency_score * 30 + Math.max(0, 100 - cancel_rate * 2) * 20) / 100;
+  const success_evidence = wilsonLower(rows.filter((r) => r.ok).length, rows.length) * 100;
+  const score = (success_evidence * 50 + latency_score * 30 + Math.max(0, 100 - cancel_rate * 2) * 20) / 100;
   return { attempts, ok: oks.length, failed: attempts - oks.length, cancelled,
            success_rate: round1(success_rate), cancel_rate: round1(cancel_rate),
            median_latency_ms: med == null ? null : round1(med), score: round1(score), verdict,

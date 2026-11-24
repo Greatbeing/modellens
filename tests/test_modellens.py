@@ -76,7 +76,9 @@ class ScoreModelTest(unittest.TestCase):
     def test_score_formula(self):
         # success 100% (50) + latency 4000ms -> latency_score 50 (30) + cancel 0 (100) (20)
         s = M.score_model([row(True, 200, 4000.0) for _ in range(20)])
-        self.assertAlmostEqual(s["score"], 85.0, places=1)
+        # success is scored on the Wilson lower bound of 20/20, not the raw 100%
+        expected = (M.wilson_lower(20, 20) * 100 * 50 + 50 * 30 + 100 * 20) / 100
+        self.assertAlmostEqual(s["score"], round(expected, 1), places=1)
 
     def test_p95_nearest_rank(self):
         lats = [100 + i * 10 for i in range(21)]
@@ -516,7 +518,8 @@ class ScoreEdgeTest(unittest.TestCase):
         self.assertEqual(s["success_rate"], 100.0)
         self.assertIsNone(s["median_latency_ms"])
         self.assertEqual(s["verdict"], "mixed")
-        self.assertAlmostEqual(s["score"], 70.0, places=1)  # 50 + 0 + 20
+        expected = (M.wilson_lower(5, 5) * 100 * 50 + 0 + 100 * 20) / 100
+        self.assertAlmostEqual(s["score"], round(expected, 1), places=1)
 
     def test_zero_latency_is_fast_not_skipped(self):
         # `(med or 9e9)` made med == 0 read as unmeasured; it is just fast.
@@ -785,5 +788,26 @@ class McpProtocolTest(unittest.TestCase):
         self.assertIn("No models matched", r["result"]["content"][0]["text"])
 
 
-if __name__ == "__main__":
-    unittest.main(verbosity=2)
+
+class EvidenceConfidenceTest(unittest.TestCase):
+    def test_one_lucky_probe_does_not_outrank_a_proven_model(self):
+        lucky = M.score_model([row(True, 200, 150.0)])
+        proven = M.score_model([row(True, 200, 400.0) for _ in range(40)])
+        self.assertTrue(lucky["low_evidence"])
+        self.assertFalse(proven["low_evidence"])
+        self.assertGreater(proven["score"], lucky["score"])
+
+    def test_wilson_lower_bounds(self):
+        self.assertEqual(M.wilson_lower(0, 0), 0.0)
+        self.assertAlmostEqual(M.wilson_lower(1, 1), 0.2065, places=3)
+        self.assertLess(M.wilson_lower(20, 20), M.wilson_lower(100, 100))
+        self.assertLessEqual(M.wilson_lower(100, 100), 1.0)
+
+    def test_lower_bound_reported(self):
+        s = M.score_model([row(True, 200, 100.0)])
+        self.assertEqual(s["success_rate"], 100.0)
+        self.assertAlmostEqual(s["success_lower_bound"], 20.7, places=1)
+
+
+if __name__ == '__main__':
+    unittest.main()
