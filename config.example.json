@@ -2,7 +2,8 @@
   "endpoints": [
     {"name": "local", "base_url": "http://127.0.0.1:3425/v1", "api_key": ""},
     {"name": "openai", "base_url": "https://api.openai.com/v1", "api_key": "sk-..."},
-    {"name": "ollama", "base_url": "http://127.0.0.1:11434/v1"}
+    {"name": "ollama", "base_url": "http://127.0.0.1:11434/v1"},
+    {"preset": "opendesign-go", "enabled": false}
   ],
   "proxy": {
     "listen": "127.0.0.1:8766",
