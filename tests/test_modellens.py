@@ -856,5 +856,43 @@ class AuditTest(unittest.TestCase):
         self.assertIn("audit needs endpoint", M.tool_audit(ctx, {}))
 
 
+class EndpointPresetTest(unittest.TestCase):
+    def _write_cfg(self, payload):
+        td = tempfile.mkdtemp()
+        p = os.path.join(td, "config.json")
+        with open(p, "w", encoding="utf-8") as fh:
+            json.dump(payload, fh)
+        return p
+
+    def test_opendesign_go_preset_expands_defaults_and_env_key(self):
+        cfg = self._write_cfg({"endpoints": [{"preset": "opendesign-go"}]})
+        with mock.patch.dict(os.environ, {"OPENDESIGN_API_KEY": "sk-test-env"}, clear=False):
+            eps = M.load_config(cfg)
+        self.assertEqual(len(eps), 1)
+        self.assertEqual(eps[0].name, "opendesign-go")
+        self.assertEqual(eps[0].base_url, "https://amr-link.open-design.ai/v1")
+        self.assertEqual(eps[0].api_key, "sk-test-env")
+        self.assertTrue(eps[0].enabled)
+
+    def test_opendesign_go_preset_allows_overrides_and_opt_out(self):
+        cfg = self._write_cfg({"endpoints": [
+            {"preset": "opendesign-go", "name": "od-custom", "api_key": "sk-explicit", "enabled": False}
+        ]})
+        with mock.patch.dict(os.environ, {"OPENDESIGN_API_KEY": "sk-test-env"}, clear=False):
+            eps = M.load_config(cfg)
+        self.assertEqual(len(eps), 1)
+        self.assertEqual(eps[0].name, "od-custom")
+        self.assertEqual(eps[0].api_key, "sk-explicit")
+        self.assertFalse(eps[0].enabled)
+
+    def test_unknown_preset_without_base_url_is_skipped(self):
+        cfg = self._write_cfg({"endpoints": [
+            {"preset": "nonexistent"},
+            {"name": "plain", "base_url": "http://127.0.0.1:9999/v1"},
+        ]})
+        eps = M.load_config(cfg)
+        self.assertEqual([e.name for e in eps], ["plain"])
+
+
 if __name__ == '__main__':
     unittest.main()

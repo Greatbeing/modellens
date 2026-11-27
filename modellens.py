@@ -1053,6 +1053,29 @@ class Context:
         self.store = Store(data_path)
 
 
+ENDPOINT_PRESETS: dict = {
+    "opendesign-go": {
+        "name": "opendesign-go",
+        "base_url": "https://amr-link.open-design.ai/v1",
+        "api_key_env": "OPENDESIGN_API_KEY",
+    },
+}
+
+
+def _resolve_endpoint_entry(entry: dict) -> dict:
+    """Expand an optional named provider preset without altering plain entries."""
+    preset_name = (entry.get("preset") or "").strip().lower()
+    merged = dict(ENDPOINT_PRESETS[preset_name]) if preset_name in ENDPOINT_PRESETS else {}
+    merged.update(entry)
+    if not (merged.get("api_key") or merged.get("apiKey")):
+        env_name = (merged.get("api_key_env") or "").strip()
+        if env_name:
+            env_val = os.environ.get(env_name, "").strip()
+            if env_val:
+                merged["api_key"] = env_val
+    return merged
+
+
 def load_config(path: str) -> list[Endpoint]:
     if not path or not os.path.exists(path):
         return []
@@ -1065,7 +1088,14 @@ def load_config(path: str) -> list[Endpoint]:
     raw = data.get("endpoints") if isinstance(data, dict) else data
     if not isinstance(raw, list):
         return []
-    return [Endpoint(e) for e in raw if isinstance(e, dict) and e.get("base_url")]
+    endpoints = []
+    for e in raw:
+        if not isinstance(e, dict):
+            continue
+        resolved = _resolve_endpoint_entry(e)
+        if resolved.get("base_url"):
+            endpoints.append(Endpoint(resolved))
+    return endpoints
 
 
 def tool_list_models(ctx: Context, args: dict) -> str:

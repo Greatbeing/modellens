@@ -117,6 +117,29 @@ python3 modellens.py --config config.json --data history.json --once ranking
 `api_key` may be empty for a localhost gateway. `models` optionally filters the
 advertised list; `enabled: false` disables an endpoint without deleting it.
 
+### Optional preset: OpenDesign Go
+
+[OpenDesign Go](https://go.open-design.ai/) exposes an OpenAI-compatible
+endpoint (`https://amr-link.open-design.ai/v1`). To opt in without typing the
+base URL manually, add the `opendesign-go` preset to `config.json` and supply
+your workspace key via `OPENDESIGN_API_KEY` (or `"api_key"` directly):
+
+```json
+{
+  "endpoints": [
+    {"preset": "opendesign-go"}
+  ]
+}
+```
+
+```bash
+export OPENDESIGN_API_KEY="sk-..."
+modellens --config config.json --data history.json --once list_models
+```
+
+See the [OpenDesign Cloud API docs](https://open-design.ai/help/cloud-api/) for
+workspace API key setup. Users who do not reference the preset are unaffected.
+
 ## Run as an MCP server
 
 Point any MCP client at it:
