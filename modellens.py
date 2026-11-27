@@ -1054,10 +1054,35 @@ class Context:
 
 
 ENDPOINT_PRESETS: dict = {
+    # Vendor presets are convenience only: they prefill name/base_url/api-key-env
+    # and nothing else. They receive no scoring, ranking or routing preference,
+    # and any OpenAI-compatible gateway can be added without one (plain entry).
+    # Keep the list vendor-neutral: add well-known gateways together, not one
+    # partner at a time (see the vendor-neutrality note in README).
     "opendesign-go": {
         "name": "opendesign-go",
         "base_url": "https://amr-link.open-design.ai/v1",
         "api_key_env": "OPENDESIGN_API_KEY",
+    },
+    "openrouter": {
+        "name": "openrouter",
+        "base_url": "https://openrouter.ai/api/v1",
+        "api_key_env": "OPENROUTER_API_KEY",
+    },
+    "siliconflow": {
+        "name": "siliconflow",
+        "base_url": "https://api.siliconflow.cn/v1",
+        "api_key_env": "SILICONFLOW_API_KEY",
+    },
+    "deepinfra": {
+        "name": "deepinfra",
+        "base_url": "https://api.deepinfra.com/v1/openai",
+        "api_key_env": "DEEPINFRA_API_KEY",
+    },
+    "groq": {
+        "name": "groq",
+        "base_url": "https://api.groq.com/openai/v1",
+        "api_key_env": "GROQ_API_KEY",
     },
 }
 

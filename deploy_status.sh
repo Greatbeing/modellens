@@ -91,7 +91,7 @@ $body$
   <section class="grid">
     <div class="card"><h3>Discover</h3><p>Lists what every OpenAI-compatible endpoint advertises.</p></div>
     <div class="card"><h3>Probe</h3><p>Real completions: latency, success, streaming TTFT, tool calls.</p></div>
-    <div class="card"><h3>Rank</h3><p>Success 50% · latency 30% · cancellations 20%, on evidence not hope.</p></div>
+    <div class="card"><h3>Rank</h3><p>Success 50% · latency 30% · cancellations 20%, with small samples discounted. <a href="https://github.com/Greatbeing/modellens#how-it-scores">How scoring works →</a></p></div>
     <div class="card"><h3>Route</h3><p>An OpenAI-compatible proxy that sends <code>auto</code> to the best measured model.</p></div>
   </section>
 </main>

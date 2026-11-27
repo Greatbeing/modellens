@@ -893,6 +893,21 @@ class EndpointPresetTest(unittest.TestCase):
         eps = M.load_config(cfg)
         self.assertEqual([e.name for e in eps], ["plain"])
 
+    def test_every_preset_resolves_with_its_env_key(self):
+        for name, spec in M.ENDPOINT_PRESETS.items():
+            env = spec["api_key_env"]
+            cfg = self._write_cfg({"endpoints": [{"preset": name}]})
+            with mock.patch.dict(os.environ, {env: "sk-p"}, clear=False):
+                eps = M.load_config(cfg)
+            self.assertEqual(eps[0].name, name, name)
+            self.assertEqual(eps[0].base_url, spec["base_url"], name)
+            self.assertEqual(eps[0].api_key, "sk-p", name)
+
+    def test_preset_list_stays_vendor_neutral(self):
+        # One lone vendor preset in the table is an ad slot, not a feature:
+        # keep the list populated or drop the mechanism. See README.
+        self.assertGreaterEqual(len(M.ENDPOINT_PRESETS), 4)
+
 
 if __name__ == '__main__':
     unittest.main()

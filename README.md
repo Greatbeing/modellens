@@ -117,28 +117,39 @@ python3 modellens.py --config config.json --data history.json --once ranking
 `api_key` may be empty for a localhost gateway. `models` optionally filters the
 advertised list; `enabled: false` disables an endpoint without deleting it.
 
-### Optional preset: OpenDesign Go
+### Optional endpoint presets
 
-[OpenDesign Go](https://go.open-design.ai/) exposes an OpenAI-compatible
-endpoint (`https://amr-link.open-design.ai/v1`). To opt in without typing the
-base URL manually, add the `opendesign-go` preset to `config.json` and supply
-your workspace key via `OPENDESIGN_API_KEY` (or `"api_key"` directly):
+A preset only prefills `name`, `base_url` and the `api_key` environment variable —
+nothing else. Presets get no scoring, ranking or routing preference of any kind:
+every gateway is probed by the same rules and the numbers are published as
+measured. Any OpenAI-compatible gateway works without a preset (plain entry).
+
+| preset | base URL | API key env |
+|---|---|---|
+| `openrouter` | `https://openrouter.ai/api/v1` | `OPENROUTER_API_KEY` |
+| `siliconflow` | `https://api.siliconflow.cn/v1` | `SILICONFLOW_API_KEY` |
+| `deepinfra` | `https://api.deepinfra.com/v1/openai` | `DEEPINFRA_API_KEY` |
+| `groq` | `https://api.groq.com/openai/v1` | `GROQ_API_KEY` |
+| `opendesign-go` | `https://amr-link.open-design.ai/v1` | `OPENDESIGN_API_KEY` |
 
 ```json
 {
   "endpoints": [
-    {"preset": "opendesign-go"}
+    {"preset": "openrouter"},
+    {"preset": "opendesign-go", "enabled": false}
   ]
 }
 ```
 
 ```bash
-export OPENDESIGN_API_KEY="sk-..."
+export OPENROUTER_API_KEY="sk-..."
 modellens --config config.json --data history.json --once list_models
 ```
 
-See the [OpenDesign Cloud API docs](https://open-design.ai/help/cloud-api/) for
-workspace API key setup. Users who do not reference the preset are unaffected.
+Entries override any preset field (`name`, `base_url`, `api_key`, `enabled`);
+unknown presets without a `base_url` are skipped. Preset lists are accepted as
+additions only when they keep this table vendor-neutral — one vendor per PR
+turns the list into an ad slot, and will be declined.
 
 ## Run as an MCP server
 
